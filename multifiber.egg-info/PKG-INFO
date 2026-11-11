@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: multifiber
+Version: 0.1.0.dev0
+Summary: Extraction and preprocessing for the multi-site stim-record photometry rig
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: pandas
+Requires-Dist: pyyaml
+Requires-Dist: h5py
+Provides-Extra: extract
+Requires-Dist: av; extra == "extract"
+Requires-Dist: pyarrow; extra == "extract"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: matplotlib; extra == "dev"
+Requires-Dist: scikit-learn; extra == "dev"

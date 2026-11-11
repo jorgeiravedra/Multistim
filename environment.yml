@@ -1,0 +1,54 @@
+# Environment for the multifiber toolkit (Windows / miniconda).
+#
+#   conda env create -f environment.yml
+#   conda activate multifiber
+#   python -m pip install -e .          # run from the directory holding pyproject.toml
+#
+# The editable install of the package itself is handled by the trailing pip
+# section below, so `conda env create` alone is sufficient. Note that pip's
+# `-e .` there is resolved relative to the directory you run conda from, not to
+# this file's location -- run it from the repo root.
+#
+# To rebuild from scratch:
+#   conda deactivate && conda env remove -n multifiber && conda env create -f environment.yml
+name: multifiber
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+
+  # --- core -------------------------------------------------------------- #
+  - numpy>=1.26
+  - scipy>=1.11
+  - pandas>=2.0
+  - pyyaml
+  - h5py                 # MATLAB v7.3 (.mat saved with -v7.3)
+
+  # --- extraction / IO ---------------------------------------------------- #
+  - av                   # PyAV, .avi frame reading (extract stage)
+  - pyarrow              # parquet outputs
+  - tqdm
+
+  # --- analysis / figures -------------------------------------------------- #
+  - scikit-learn
+  - statsmodels          # mixed models for the weight-matrix stats
+  - matplotlib>=3.8
+  - seaborn
+
+  # --- notebook ------------------------------------------------------------ #
+  # ipykernel is required for this env to appear as a Jupyter kernel; without
+  # it a notebook launched from base runs on base's interpreter and will not
+  # see the package installed here.
+  - ipykernel
+  - jupyterlab
+  - ipympl               # interactive matplotlib in JupyterLab (%matplotlib widget)
+
+  # --- dev ----------------------------------------------------------------- #
+  - pytest
+  - pytest-cov
+  - ruff
+
+  - pip:
+      - -e .

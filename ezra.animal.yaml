@@ -1,0 +1,43 @@
+# multifiber animal record -- EDIT THE FIBER ORDER.
+# Do not copy another animal's order unless the implant
+# genuinely matches: a wrong order permutes the connectivity
+# matrix with no error raised.
+#
+# multifiber animal record: <animal_id>.animal.yaml
+#
+# Minimal form is two keys: animal_id and fibers.  'index' is the 1-based ROI
+# number from the calibration GUI, which is also the laser ID in the stim log;
+# it is the only join between laser events and photometry channels.  Get it
+# wrong and the connectivity matrix is permuted with no error raised.
+#
+# Calibration files are NOT listed here -- they describe the rig, are shared
+# across animals, and are resolved per session by date.  Pin one only to
+# override that (see the commented block at the bottom).
+animal_id: ezra
+fibers:
+  - {index: 1,  region: VMHvl, hemisphere: R}
+  - {index: 2,  region: AH,    hemisphere: R}
+  - {index: 3,  region: PrL,   hemisphere: R}
+  - {index: 4,  region: PMv,   hemisphere: R}
+  - {index: 5,  region: MeA,   hemisphere: R}
+  - {index: 6,  region: LHb,   hemisphere: R}
+  - {index: 7,  region: lPAG,  hemisphere: R}
+  - {index: 8,  region: PA,    hemisphere: R}
+  - {index: 9,  region: NAc,   hemisphere: R}
+  - {index: 10, region: vLS,   hemisphere: R}
+  - {index: 11, region: mPOA,  hemisphere: M}
+  - {index: 12, region: BNST,  hemisphere: R}
+
+# Everything below is optional.
+# genotype: Vgat-Cre;CD1
+# sex: M
+# cohort:
+# condition:          # EXP / NON / OBS
+#
+# Per-fiber extras, added as histology comes in.  histology defaults to
+# 'pending', which leaves a fiber out of region_map(included_only=True):
+#   - {index: 1, region: VMHvl, hemisphere: R, histology: pass}
+#
+# calibration_overrides:
+#   translated_coords: TranslatedCoords_100726.mat
+#   mids: mids_100726.mat

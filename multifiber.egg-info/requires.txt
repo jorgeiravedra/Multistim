@@ -1,0 +1,14 @@
+numpy
+scipy
+pandas
+pyyaml
+h5py
+
+[dev]
+pytest
+matplotlib
+scikit-learn
+
+[extract]
+av
+pyarrow

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multifiber"
+version = "0.1.0.dev0"
+description = "Extraction and preprocessing for the multi-site stim-record photometry rig"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pandas", "pyyaml", "h5py"]
+
+[project.optional-dependencies]
+extract = ["av", "pyarrow"]
+dev = ["pytest", "matplotlib", "scikit-learn"]
+
+[tool.setuptools.packages.find]
+include = ["multifiber*"]
