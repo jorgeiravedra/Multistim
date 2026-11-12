@@ -65,6 +65,12 @@ def main() -> int:
                          "picks per fiber by out-of-sample error on held-out "
                          "blocks, scored outside the stimulation windows so "
                          "the choice cannot be influenced by the response.")
+    ap.add_argument("--tail-method",
+                    choices=("lasso", "ols", "ridge"), default="lasso",
+                    help="hierarchical only: estimator for the second stage. "
+                         "lasso keeps only components that earn their place; "
+                         "ols and ridge use them all, which suits principal "
+                         "components that are orthogonal anyway.")
     ap.add_argument("--stim-artifact", action="store_true",
                     help="add stimulus-locked square and kinetic regressors. "
                          "The square term absorbs an optical artifact, which "

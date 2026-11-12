@@ -421,7 +421,24 @@ def process_session(
                 pulses,
                 max_gap_s=(None if cfg.group_bursts == "auto"
                            else float(cfg.group_bursts)))
-            if pulses.params.get("grouped_into_bursts"):
+            gp = pulses.params
+            if gp.get("grouped_into_bursts"):
+                # A "burst" lasting tens of seconds at a fraction of a hertz
+                # is not a burst; it is several trials that the gap-finder
+                # merged. The within-train rate is the tell.
+                rate = gp.get("within_burst_rate_hz")
+                wid = (float(np.median(pulses.width_s)) if pulses.n else 0.0)
+                if rate is not None and rate < 1.0 and wid > 2.0:
+                    warnings.append(
+                        f"burst grouping produced {pulses.n} events of "
+                        f"{wid:.1f} s each at {rate:.2f} Hz within the "
+                        "train. A train that slow and that long is more "
+                        "likely to be separate trials merged by the gap "
+                        "finder than one burst. Set group_bursts to None "
+                        "(--group-bursts none) if single pulses are the "
+                        "trials, or give an explicit gap in seconds."
+                    )
+            if gp.get("grouped_into_bursts"):
                 ppb = pulses.params["pulses_per_burst"]
                 warnings.append(
                     f"grouped {n_before} laser pulses into {pulses.n} bursts "

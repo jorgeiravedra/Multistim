@@ -60,6 +60,7 @@ __all__ = [
     "detect_laser_pulses",
     "group_pulses_into_bursts",
     "classify_protocols",
+    "format_duration",
     "infer_protocol",
     "parse_session_name",
     "protocol_matches_name",
@@ -1115,10 +1116,29 @@ def group_pulses_into_bursts(
     return out
 
 
+def format_duration(seconds: float) -> str:
+    """Duration as a label, without rounding a short pulse to nothing.
+
+    A 0.5 ms sham formatted to the nearest millisecond reads "0 ms", which
+    is both wrong and the one condition whose absence is hardest to notice.
+    """
+    if not np.isfinite(seconds) or seconds <= 0:
+        return "?"
+    ms = seconds * 1e3
+    if ms < 1:
+        return f"{ms:.2f} ms".replace(".00", "")
+    if ms < 10:
+        return f"{ms:.1f} ms".replace(".0", "")
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    return f"{seconds:.2f} s".replace(".00", "")
+
+
 def classify_protocols(
     events: "LaserPulses",
     roi_id: Optional[np.ndarray] = None,
     tol: float = 0.15,
+    gate_tol: float = 0.35,
     min_events: int = 3,
     split_on_power: bool = True,
 ) -> np.ndarray:
@@ -1130,8 +1150,17 @@ def classify_protocols(
     session with one set of protocol parameters averages across conditions
     and describes none of them.
 
-    Events are grouped on commanded duration, and then on command voltage
-    **within a stimulated site**.  The voltage is not comparable across sites:
+    Events are grouped on three measured quantities: the commanded
+    duration, the structure of the gate inside it (how many pulses, and what
+    fraction of the window the laser was on), and the command voltage
+    **within a stimulated site**.
+
+    The gate features matter because a session can interleave conditions
+    that share an envelope -- three rates inside the same one-second train,
+    or the same rate at different pulse widths -- and duration alone cannot
+    tell those apart. Rate is ``n_gate_pulses / width``, and duty is the
+    fraction of the window with the laser on; both come from the gate
+    channel rather than from any setting.  The voltage is not comparable across sites:
     it encodes which fiber is being driven, taken from ``intensity_mat``,
     where each region has its own value for the same delivered power.
     Splitting on raw voltage therefore separates sites rather than
@@ -1152,14 +1181,59 @@ def classify_protocols(
     if n == 0:
         return np.zeros(0, dtype=int)
 
-    order = np.argsort(w)
-    labels = np.full(n, -1, dtype=int)
-    cur, ref = 0, w[order[0]]
-    for i in order:
-        if ref > 0 and abs(w[i] - ref) / ref > tol:
-            cur += 1
-            ref = w[i]
-        labels[i] = cur
+    def _split(labels, x, tolerance=tol):
+        """Subdivide existing labels at GAPS in a measured quantity.
+
+        Each value is compared with the one before it in sorted order, not
+        with the first of the group. Comparing against a group anchor makes
+        the test chain: a continuous spread wider than the tolerance gets
+        cut at whatever point the running total happens to cross it, which
+        turns measurement noise in the gate rate into spurious conditions.
+        A gap between neighbours is a real discontinuity; a slow drift
+        across the range is not.
+        """
+        out = labels.copy()
+        nxt = int(labels.max()) + 1 if labels.size else 0
+        for c in np.unique(labels):
+            m = labels == c
+            xs = x[m]
+            if not np.isfinite(xs).any() or np.nanmax(xs) <= 0:
+                continue
+            idxs = np.flatnonzero(m)[np.argsort(
+                np.where(np.isfinite(xs), xs, np.inf))]
+            sub = np.zeros(idxs.size, dtype=int)
+            grp = 0
+            for k in range(1, idxs.size):
+                prev, cur = x[idxs[k - 1]], x[idxs[k]]
+                if not (np.isfinite(prev) and np.isfinite(cur)) or prev <= 0:
+                    sub[k] = grp
+                    continue
+                if abs(cur - prev) / prev > tolerance:
+                    grp += 1
+                sub[k] = grp
+            for g in range(1, grp + 1):
+                out[idxs[sub == g]] = nxt
+                nxt += 1
+        return out
+
+    labels = _split(np.zeros(n, dtype=int), w)
+
+    # Gate structure: distinguishes conditions that share an envelope.
+    gp = getattr(events, "n_gate_pulses", None)
+    if gp is not None:
+        gp = np.asarray(gp, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rate = np.where(w > 0, gp / w, np.nan)
+        if np.isfinite(rate).any() and np.nanmax(rate) > 0:
+            # Gate features are measured rather than commanded, so they
+            # carry more spread than a duration does; a looser tolerance
+            # keeps that spread from reading as a condition.
+            labels = _split(labels, rate, gate_tol)
+    gd = getattr(events, "gate_duty", None)
+    if gd is not None:
+        gd = np.asarray(gd, dtype=float)
+        if np.isfinite(gd).any() and np.nanmax(gd) > 0:
+            labels = _split(labels, gd, gate_tol)
 
     # Split further on power. The raw command voltage is not comparable
     # across sites -- it encodes which fiber is driven, from intensity_mat,
@@ -1168,7 +1242,12 @@ def classify_protocols(
     # near 1 is "this site's usual power"; a distinct cluster away from 1 is
     # a genuine power condition, and is the same condition at every site.
     out = labels.copy()
-    if split_on_power and roi_id is not None and np.isfinite(v).any():
+    rid_ok = False
+    if roi_id is not None:
+        _rid = np.asarray(roi_id)
+        rid_ok = bool(np.all(np.isfinite(_rid.astype(float)))
+                      and np.all(_rid > 0))
+    if split_on_power and rid_ok and np.isfinite(v).any():
         rid = np.asarray(roi_id, dtype=int)
         v_rel = np.full(n, np.nan)
         for r in np.unique(rid):
@@ -1259,13 +1338,20 @@ def infer_protocol(
         per = []
         for c in np.unique(classes):
             m = classes == c
+            dur = float(np.median(b_for_class.width_s[m]))
+            npul = (float(np.nanmedian(
+                np.asarray(b_for_class.n_gate_pulses, dtype=float)[m]))
+                if getattr(b_for_class, "n_gate_pulses", None) is not None
+                else None)
             per.append({
                 "class": int(c),
                 "n_events": int(m.sum()),
-                "duration_s": float(np.median(b_for_class.width_s[m])),
+                "duration_s": dur,
                 "command_v": float(np.nanmedian(b_for_class.amplitude_v[m])),
                 "gate_duty": float(np.nanmedian(b_for_class.gate_duty[m]))
                 if np.isfinite(b_for_class.gate_duty[m]).any() else None,
+                "n_gate_pulses": npul,
+                "gate_rate_hz": (npul / dur if npul and dur > 0 else None),
             })
         out["protocol_classes"] = per
         out["interleaved"] = True

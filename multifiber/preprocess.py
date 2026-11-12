@@ -672,6 +672,7 @@ def build_isosbestic_predictors(
 
     ``'same'``    that fiber's own isosbestic only.
     ``'all'``     every fiber's isosbestic as a separate predictor.
+    ``'others'``  every fiber's EXCEPT this one, separately.
     ``'common'``  the fiber's own isosbestic PLUS a common component built
                   from the OTHER fibers.
 
@@ -721,8 +722,18 @@ def build_isosbestic_predictors(
         return X[:, [j]], ["own"]
     if mode == "all":
         return X, [f"iso{k}" for k in range(n_roi)]
+    if mode == "others":
+        # Every other fiber's isosbestic as its own predictor, with this
+        # fiber's excluded. Where an artifact reaches several fibers but not
+        # uniformly, the others carry it in a pattern that a single summary
+        # cannot represent -- and leaving the own fiber out keeps the fit
+        # from simply reproducing it.
+        other = [k for k in range(n_roi) if k != j]
+        return X[:, other], [f"iso{k}" for k in other]
     if mode != "common":
-        raise ValueError(f"unknown predictor mode {mode!r}")
+        raise ValueError(
+            f"unknown predictor mode {mode!r}; expected 'same', 'all', "
+            "'others' or 'common'")
 
     others = [k for k in range(n_roi) if k != j]
     if not others:
@@ -821,6 +832,30 @@ class ProcessedTraces:
     def n_samples(self) -> int:
         return int(self.dff.shape[0])
 
+    def to_frame(self):
+        """Long-form table for ``<sid>_dff.parquet``.
+
+        One row per signal sample. ``t`` is DAQ time and ``frame`` the video
+        frame index, so this joins to the events table and to the raw
+        traces without re-deriving anything. Each ROI appears as its own
+        column, with the isosbestic alongside as ``<label>__iso``, and
+        ``blanked`` marks samples dropped as laser-contaminated -- those are
+        NaN in the ROI columns, and the flag records that they were removed
+        rather than merely missing.
+        """
+        import pandas as pd
+
+        cols = self.labels or [f"roi{i + 1}"
+                               for i in range(self.dff.shape[1])]
+        df = pd.DataFrame(self.dff, columns=list(cols))
+        df.insert(0, "t", self.t)
+        df.insert(1, "frame", self.frames)
+        df["blanked"] = self.blanked
+        if self.isos_dff is not None and self.isos_dff.size:
+            for i, c in enumerate(cols):
+                df[f"{c}__iso"] = self.isos_dff[:, i]
+        return df
+
 
 def stim_regressors(
     t: np.ndarray,
@@ -881,6 +916,8 @@ def regress_isosbestic(
     unpenalized: int = 0,
     head_method: str = "ols",
     head_alpha: "float | str" = "cv",
+    tail_method: str = "lasso",
+    non_negative: bool = False,
     keep: Optional[Sequence[int]] = None,
     score_mask: Optional[np.ndarray] = None,
     fit_mask: Optional[np.ndarray] = None,
@@ -899,16 +936,21 @@ def regress_isosbestic(
         is tuned on total prediction error, which slow drift dominates, so
         it can discard a predictor carrying a brief artifact.
     ``'ols'``
-        Ordinary least squares, no penalty and no sign constraint.  Fits
-        every predictor fully, which is what a brief artifact needs, at the
-        cost of fitting noise when predictors are many or collinear.
+        Least squares with no penalty.  Fits every predictor fully, which is
+        what a brief artifact needs, at the cost of fitting noise when
+        predictors are many or collinear.  ``non_negative`` keeps
+        coefficients at or above zero: a negative weight would ADD the
+        predictor to the residual, and where the isosbestic carries little
+        shared variance an unconstrained fit can do exactly that, putting
+        415 noise into the signal channel.  Set it False only to see what
+        the unconstrained fit wants.
     ``'ridge'``
         L2, shrinking all coefficients smoothly rather than zeroing any.
         Sensible with several correlated predictors.
     ``'hierarchical'``
         Two stages. The first ``unpenalized`` columns are fitted with
-        ``head_method`` (at ``head_alpha``), and the rest are fitted to the
-        residual with ``method``'s usual Lasso at ``alpha``. The own-fiber
+        ``head_method`` at ``head_alpha``; the rest are fitted to the
+        residual with ``tail_method`` at ``alpha``. The own-fiber
         isosbestic is therefore never shrunk away by a penalty chosen for
         the others, which is the failure the plain Lasso showed on a
         minority artifact.
@@ -916,9 +958,12 @@ def regress_isosbestic(
         Both stages are configurable because neither choice is obviously
         right. An unpenalized OLS head fits the own fiber fully, including
         its noise; a penalized head fits it more conservatively and can
-        work better where the isosbestic carries the artifact strongly.
-        Which wins is a property of the recording, not something to settle
-        by argument.
+        work better where the isosbestic carries the artifact strongly. The
+        tail is a different question again: a sparse Lasso keeps only the
+        components that earn their place, while OLS or ridge use them all,
+        which suits a tail of principal components that are orthogonal by
+        construction and therefore not competing. Which wins is a property
+        of the recording, not something to settle by argument.
 
     ``unpenalized`` is the number of leading columns in the first stage.
 
@@ -981,6 +1026,27 @@ def regress_isosbestic(
     info["n_fit"] = int(ok_fit.sum())
 
     def _ols(A, b):
+        """Least squares, optionally constrained to non-negative weights.
+
+        The constraint is not cosmetic. ``resid = y - beta * x``, so a
+        NEGATIVE beta adds the predictor to the residual rather than
+        removing it: where the isosbestic carries little shared variance,
+        an unconstrained fit can land on a small negative weight and inject
+        415 noise into the signal channel. It shows up as a processed trace
+        that resembles the isosbestic instead of being cleaned of it.
+
+        An artifact adds light to both channels, so the physically
+        meaningful weight is non-negative, and the Lasso branch has always
+        enforced it.
+        """
+        if non_negative:
+            try:
+                from scipy.optimize import nnls
+
+                coef, _ = nnls(A, b)
+                return coef
+            except Exception:
+                pass
         coef, *_ = np.linalg.lstsq(A, b, rcond=None)
         return coef
 
@@ -1024,6 +1090,7 @@ def regress_isosbestic(
     elif method == "ridge":
         from sklearn.linear_model import Ridge, RidgeCV
 
+
         if alpha == "cv":
             m = RidgeCV(alphas=np.logspace(-8, 2, n_alphas))
         else:
@@ -1052,11 +1119,13 @@ def regress_isosbestic(
         resid = yc - Xc[:, :k] @ head
         if Xc.shape[1] > k:
             tail, sub = regress_isosbestic(resid, Xc[:, k:], alpha=alpha,
-                                           method="lasso")
+                                           method=tail_method)
             coef = np.r_[head, np.asarray(sub["coefficients"],
                                           dtype=float).ravel()]
             info["alpha"] = sub["alpha"]
-            info["alpha_source"] += f" + tail {sub['alpha_source']}"
+            info["alpha_source"] += (f" + {tail_method} tail "
+                                     f"({sub['alpha_source']})")
+            info["tail_method"] = tail_method
         else:
             coef = head
             info["alpha"] = 0.0
@@ -1094,6 +1163,13 @@ def regress_isosbestic(
     fitted = Xc @ coef
     denom = float(np.sum(yc ** 2))
     info["coefficients"] = [float(c) for c in coef]
+    n_neg = int(np.sum(np.asarray(coef) < -1e-12))
+    info["n_negative_coefficients"] = n_neg
+    if n_neg:
+        info["warning"] = (
+            f"{n_neg} negative coefficient(s): those predictors are being "
+            "ADDED to the residual, not removed. Where a predictor carries "
+            "little shared variance this injects its noise into the signal.")
     info["r2_in_sample"] = (float(1.0 - np.sum((yc - fitted) ** 2) / denom)
                             if denom > 0 else float("nan"))
     sd_before = float(np.std(y[ok]))
@@ -1122,6 +1198,7 @@ def preprocess_traces(
     regress_method: str = "lasso",
     head_method: str = "ols",
     head_alpha: "float | str" = "cv",
+    tail_method: str = "lasso",
     unpenalized: int = 1,
     stim_artifact: bool = False,
     stim_decay_tau: float = 0.4,
@@ -1339,7 +1416,7 @@ def preprocess_traces(
                 method=("ols" if stim_X is not None and
                         regress_method == "lasso" else regress_method),
                 head_method=head_method, head_alpha=head_alpha,
-                unpenalized=unpenalized, keep=keep,
+                tail_method=tail_method, unpenalized=unpenalized, keep=keep,
                 score_mask=score_mask)
             if keep is not None:
                 stim_amp.append(info["coefficients"][keep[0]])

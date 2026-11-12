@@ -38,163 +38,348 @@ import argparse
 from pathlib import Path
 
 
+
+# --------------------------------------------------------------------------- #
+# Design
+#
+# The plots are the content; everything else is instrument housing and should
+# recede. Colour comes from the rig's own optics rather than a stock palette:
+# the excitation wavelengths are the subject matter, so 470 nm blue and 415 nm
+# violet label the channels they belong to, and the 640 nm laser red marks
+# stimulation. That makes colour carry information instead of decorating.
+#
+# Two faces, each with a job: Plex Sans for the interface, Plex Mono wherever
+# figures need to line up in a column. Mono is not used for ordinary labels.
+# --------------------------------------------------------------------------- #
+
+INDEX = """<!DOCTYPE html>
+<html>
+  <head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --ink:        #162029;
+        --ink-soft:   #5B6B78;
+        --ink-faint:  #8D9BA6;
+        --panel:      #F2F4F6;
+        --panel-deep: #E6EAEE;
+        --rule:       #D6DEE4;
+        --paper:      #FFFFFF;
+        --ex470:      #1457B8;
+        --ex415:      #6B46C1;
+        --laser:      #C0392B;
+        --ok:         #1B7F5A;
+        --sans: "IBM Plex Sans", system-ui, sans-serif;
+        --mono: "IBM Plex Mono", ui-monospace, monospace;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--panel); color: var(--ink);
+        font-family: var(--sans); font-size: 13px; line-height: 1.45;
+        -webkit-font-smoothing: antialiased;
+      }
+      .bench { min-height: 100vh; }
+
+      /* identity bar */
+      .bar {
+        display: flex; align-items: baseline; gap: 14px;
+        padding: 10px 18px; background: var(--paper);
+        border-bottom: 1px solid var(--rule);
+      }
+      .bar h1 {
+        margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+      }
+      .bar .sid { font-family: var(--mono); font-size: 12px;
+                  color: var(--ink-soft); }
+      .bar .note { font-size: 11px; color: var(--ink-faint); }
+
+      /* the session picker sits in the bar, quiet until needed */
+      .picker { display: flex; gap: 6px; align-items: center;
+                flex-wrap: wrap; padding: 8px 18px; background: var(--paper);
+                border-bottom: 1px solid var(--rule); }
+
+      input[type=text], input[type=number] {
+        font-family: var(--mono); font-size: 12px; color: var(--ink);
+        background: var(--paper); border: 1px solid var(--rule);
+        border-radius: 3px; padding: 5px 7px;
+      }
+      input:focus-visible, button:focus-visible, summary:focus-visible {
+        outline: 2px solid var(--ex470); outline-offset: 1px;
+      }
+      button {
+        font-family: var(--sans); font-size: 12px; font-weight: 500;
+        color: var(--paper); background: var(--ink);
+        border: 1px solid var(--ink); border-radius: 3px;
+        padding: 6px 12px; cursor: pointer;
+      }
+      button:hover { background: #28343E; }
+      button.quiet {
+        color: var(--ink); background: var(--paper); border-color: var(--rule);
+      }
+      button.quiet:hover { background: var(--panel-deep); }
+
+      /* control groups: closed by default except the first, so the wall of
+         inputs becomes something you open when you need it */
+      .group { border-bottom: 1px solid var(--rule); }
+      .group > summary {
+        cursor: pointer; padding: 8px 12px; font-weight: 500; font-size: 12px;
+        list-style: none; display: flex; justify-content: space-between;
+        align-items: center;
+      }
+      .group > summary::-webkit-details-marker { display: none; }
+      .group > summary::after {
+        content: "+"; color: var(--ink-faint); font-family: var(--mono);
+      }
+      .group[open] > summary::after { content: "\2013"; }
+      .group[open] > summary { background: var(--panel-deep); }
+      .group .body { padding: 6px 12px 12px; }
+
+      .field { margin-bottom: 10px; }
+      .field > label {
+        display: block; font-size: 11px; font-weight: 500;
+        color: var(--ink-soft); margin-bottom: 3px;
+      }
+      .hint { font-size: 10.5px; color: var(--ink-faint); line-height: 1.35;
+              margin-top: 2px; max-width: 46ch; }
+
+      .rail {
+        width: 290px; flex: none; background: var(--paper);
+        border-right: 1px solid var(--rule); align-self: stretch;
+      }
+      .rail h2 {
+        margin: 0; padding: 10px 12px 8px; font-size: 12px; font-weight: 600;
+        border-bottom: 1px solid var(--rule);
+      }
+      .rail.b h2 { color: var(--laser); }
+      .rail.a h2 { color: var(--ex470); }
+
+      .stage { flex: 1; min-width: 0; padding: 8px 10px 24px; }
+      .readout {
+        font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+        background: var(--paper); border: 1px solid var(--rule);
+        border-radius: 3px; padding: 10px 12px; white-space: pre;
+        overflow-x: auto; color: var(--ink);
+      }
+      .strip {
+        display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+        padding: 8px 12px; background: var(--paper);
+        border-bottom: 1px solid var(--rule);
+      }
+      .strip label { font-size: 11px; color: var(--ink-soft); }
+      .ch470 { color: var(--ex470); font-weight: 600; }
+      .ch415 { color: var(--ex415); font-weight: 600; }
+      .caution { color: var(--laser); }
+
+      /* tabs */
+      .tab-bar { background: var(--paper); border-bottom: 1px solid var(--rule); }
+      .tab {
+        font-family: var(--sans) !important; font-size: 12.5px !important;
+        border: none !important; background: transparent !important;
+        color: var(--ink-soft) !important; padding: 9px 16px !important;
+      }
+      .tab--selected {
+        color: var(--ink) !important; font-weight: 600 !important;
+        box-shadow: inset 0 -2px 0 var(--ex470) !important;
+      }
+      .Select-control, .Select-menu-outer { font-size: 12px !important; }
+      @media (prefers-reduced-motion: reduce) {
+        * { animation: none !important; transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body>
+</html>"""
+
 def build_controls(dash, prefix: str, defaults: dict):
-    """One column of controls for a variant."""
+    """One variant's controls, grouped so they can be closed.
+
+    Twenty inputs in a column is a wall; the same twenty in four named
+    groups is a thing you open when you need it. Only the group most often
+    adjusted stays open.
+    """
     from dash import dcc, html
 
-    def row(label, ctrl, hint=""):
-        return html.Div([
-            html.Label(label, style={"fontSize": "11px", "fontWeight": 600}),
-            ctrl,
-            html.Div(hint, style={"fontSize": "9px", "color": "#777"}),
-        ], style={"marginBottom": "8px"})
+    def field(label, ctrl, hint=""):
+        kids = [html.Label(label), ctrl]
+        if hint:
+            kids.append(html.Div(hint, className="hint"))
+        return html.Div(kids, className="field")
+
+    def group(title, children, open_=False):
+        return html.Details(
+            [html.Summary(title), html.Div(children, className="body")],
+            open=open_, className="group")
+
+    baseline = [
+        field("Baseline timescale (s)",
+              dcc.Slider(id=f"{prefix}-tau", min=2, max=180, step=1,
+                         value=defaults["tau"],
+                         marks={2: "2", 60: "60", 180: "180"},
+                         tooltip={"placement": "bottom",
+                                  "always_visible": True}),
+              "What F0 is allowed to follow. Lambda is derived from this and "
+              "the measured sampling rate."),
+        field("Lambda, set directly",
+              dcc.Input(id=f"{prefix}-lam", type="text", value="",
+                        placeholder="blank = from timescale",
+                        style={"width": "100%"})),
+        field("Difference order",
+              dcc.RadioItems(id=f"{prefix}-diff",
+                             options=[{"label": " 1", "value": 1},
+                                      {"label": " 2", "value": 2}],
+                             value=defaults["diff"], inline=True),
+              "First order drives F0 toward a constant and cannot follow "
+              "bleaching."),
+        field("Where F0 sits",
+              dcc.RadioItems(id=f"{prefix}-method",
+                             options=[{"label": " Lower envelope (airPLS)",
+                                       "value": "airpls"},
+                                      {"label": " Centre (symmetric)",
+                                       "value": "symmetric"}],
+                             value=defaults["method"]),
+              "airPLS discards samples above the baseline, so dF/F comes out "
+              "positively skewed. Symmetric is linear, which suits the "
+              "isosbestic regression."),
+    ]
+
+    motion = [
+        field("Isosbestic predictors",
+              dcc.RadioItems(id=f"{prefix}-pred",
+                             options=[{"label": " None", "value": "none"},
+                                      {"label": " This fiber", "value": "same"},
+                                      {"label": " Every fiber", "value": "all"},
+                                      {"label": " Other fibers only",
+                                       "value": "others"},
+                                      {"label": " This fiber + the others",
+                                       "value": "common"}],
+                             value=defaults["pred"]),
+              "A fiber's own 415 cannot see an artifact that missed its "
+              "frames; the others can."),
+        field("Component from the others",
+              dcc.RadioItems(id=f"{prefix}-common",
+                             options=([{"label": " Median",
+                                        "value": "median"}]
+                                      + [{"label": f" PC1-{k}" if k > 1
+                                          else " PC1", "value": f"pc{k}"}
+                                         for k in range(1, 8)]),
+                             value=defaults["common"]),
+              "One component assumes a single artifact waveform; more allow "
+              "for independent sources."),
+        field("Estimator",
+              dcc.RadioItems(id=f"{prefix}-rmethod",
+                             options=[{"label": " Lasso", "value": "lasso"},
+                                      {"label": " Least squares",
+                                       "value": "ols"},
+                                      {"label": " Ridge", "value": "ridge"},
+                                      {"label": " Two stage",
+                                       "value": "hierarchical"},
+                                      {"label": " Pick per fiber",
+                                       "value": "auto"}],
+                             value=defaults.get("rmethod", "lasso"))),
+        field("Penalty",
+              dcc.Input(id=f"{prefix}-alpha", type="text",
+                        value=defaults["alpha"], style={"width": "100%"}),
+              "cv tunes on overall drift, which can discard a brief "
+              "artifact. 1e-6 keeps it."),
+        field("Two stage: first stage",
+              html.Div([
+                  dcc.RadioItems(id=f"{prefix}-head",
+                                 options=[{"label": " Least squares",
+                                           "value": "ols"},
+                                          {"label": " Lasso",
+                                           "value": "lasso"},
+                                          {"label": " Ridge",
+                                           "value": "ridge"}],
+                                 value=defaults.get("head", "ols"),
+                                 inline=True),
+                  html.Div([
+                      dcc.Input(id=f"{prefix}-halpha", type="text",
+                                value=defaults.get("halpha", "cv"),
+                                style={"width": "70px"}),
+                      dcc.Input(id=f"{prefix}-unpen", type="number",
+                                value=defaults.get("unpen", 1), min=1, max=8,
+                                step=1, style={"width": "60px"}),
+                  ], style={"display": "flex", "gap": "6px",
+                            "marginTop": "4px"}),
+              ]),
+              "This fiber's own isosbestic, fitted before anything else so a "
+              "penalty chosen for the others cannot shrink it away."),
+        field("Two stage: second stage",
+              dcc.RadioItems(id=f"{prefix}-tail",
+                             options=[{"label": " Lasso", "value": "lasso"},
+                                      {"label": " Least squares",
+                                       "value": "ols"},
+                                      {"label": " Ridge", "value": "ridge"}],
+                             value=defaults.get("tail", "lasso"), inline=True),
+              "Fitted to the first stage's residual. Principal components do "
+              "not compete, so a penalty buys little there."),
+    ]
+
+    artifact = [
+        field("Laser frames",
+              dcc.RadioItems(id=f"{prefix}-blank",
+                             options=[{"label": " Drop", "value": 1},
+                                      {"label": " Keep", "value": 0}],
+                             value=defaults["blank"], inline=True)),
+        field("Exposure (ms)",
+              dcc.Input(id=f"{prefix}-exp", type="number", value=8.5,
+                        step=0.1, style={"width": "100%"}),
+              "Measured from the camera, not assumed. Which frames count as "
+              "contaminated depends on it."),
+        field("Fit a stimulus-locked term",
+              dcc.RadioItems(id=f"{prefix}-stimart",
+                             options=[{"label": " No", "value": 0},
+                                      {"label": " Yes", "value": 1}],
+                             value=defaults.get("stimart", 0), inline=True),
+              "Separates a square artifact from a response by kinetics. "
+              "Assumes the response has some, which prejudges its shape."),
+    ]
+
+    windows = [
+        field("Baseline before onset (s)",
+              dcc.Slider(id=f"{prefix}-base", min=0.1, max=4, step=0.1,
+                         value=defaults["base"],
+                         marks={0.5: "0.5", 2: "2", 4: "4"},
+                         tooltip={"placement": "bottom",
+                                  "always_visible": True}),
+              "Short windows are noisier than they look: autocorrelation "
+              "makes 20 samples worth about 1.5 independent ones."),
+        field("Response window (s)",
+              dcc.RangeSlider(id=f"{prefix}-resp", min=-1, max=5, step=0.1,
+                              value=defaults["resp"],
+                              marks={0: "0", 2: "2", 4: "4"},
+                              tooltip={"placement": "bottom",
+                                       "always_visible": True})),
+        field("Per-trial baseline",
+              dcc.RadioItems(id=f"{prefix}-detrend",
+                             options=[{"label": " Level", "value": "mean"},
+                                      {"label": " Level and slope",
+                                       "value": "linear"}],
+                             value=defaults["detrend"], inline=True)),
+        field("Combine trials",
+              dcc.RadioItems(id=f"{prefix}-stat",
+                             options=[{"label": " Mean", "value": "mean"},
+                                      {"label": " Median", "value": "median"}],
+                             value=defaults["stat"], inline=True)),
+        field("Low-pass (Hz, 0 is off)",
+              dcc.Input(id=f"{prefix}-lp", type="number", value=0, step=0.5,
+                        style={"width": "100%"}),
+              "GCaMP6f cannot follow above about 5 Hz."),
+    ]
 
     return html.Div([
-        html.H4(prefix, style={"marginBottom": "6px"}),
-        row("baseline tau (s)",
-            dcc.Slider(id=f"{prefix}-tau", min=2, max=180, step=1,
-                       value=defaults["tau"],
-                       marks={2: "2", 20: "20", 60: "60", 120: "120",
-                              180: "180"},
-                       tooltip={"placement": "bottom", "always_visible": True}),
-            "lambda is derived from this and the measured rate"),
-        row("lambda override",
-            dcc.Input(id=f"{prefix}-lam", type="text", value="",
-                      placeholder="blank = from tau",
-                      style={"width": "100%"}),
-            "set a raw penalty to bypass the timescale conversion"),
-        row("difference order",
-            dcc.RadioItems(id=f"{prefix}-diff",
-                           options=[{"label": " 1", "value": 1},
-                                    {"label": " 2", "value": 2}],
-                           value=defaults["diff"], inline=True),
-            "1 drives F0 toward a constant and cannot follow bleaching"),
-        row("baseline method",
-            dcc.RadioItems(id=f"{prefix}-method",
-                           options=[{"label": " airPLS", "value": "airpls"},
-                                    {"label": " symmetric",
-                                     "value": "symmetric"}],
-                           value=defaults["method"], inline=True),
-            "airPLS follows the lower envelope; symmetric the centre"),
-        row("isosbestic regressors",
-            dcc.RadioItems(id=f"{prefix}-pred",
-                           options=[{"label": " none", "value": "none"},
-                                    {"label": " same fiber", "value": "same"},
-                                    {"label": " all fibers", "value": "all"},
-                                    {"label": " others only",
-                                     "value": "others"},
-                                    {"label": " own + common",
-                                     "value": "common"}],
-                           value=defaults["pred"]),
-            "common averages the others' noise down; same is conservative"),
-        row("common component",
-            dcc.RadioItems(id=f"{prefix}-common",
-                           options=([{"label": " median",
-                                      "value": "median"}]
-                                    + [{"label": f" PC1-{k}" if k > 1
-                                        else " PC1", "value": f"pc{k}"}
-                                       for k in range(1, 8)]),
-                           value=defaults["common"]),
-            "more components model several independent artifact sources; "
-            "judge them on the detection floor, not on R^2"),
-        row("Lasso alpha",
-            dcc.Input(id=f"{prefix}-alpha", type="text",
-                      value=defaults["alpha"], style={"width": "100%"}),
-            "'cv' for blocked cross-validation, or a number"),
-        row("regression estimator",
-            dcc.RadioItems(id=f"{prefix}-rmethod",
-                           options=[{"label": " lasso", "value": "lasso"},
-                                    {"label": " OLS", "value": "ols"},
-                                    {"label": " ridge", "value": "ridge"},
-                                    {"label": " hierarchical",
-                                     "value": "hierarchical"},
-                                    {"label": " auto (per fiber)",
-                                     "value": "auto"}],
-                           value=defaults.get("rmethod", "lasso")),
-            "hierarchical fits the own fiber unpenalized first, so a "
-            "penalty chosen for the others cannot shrink it away"),
-        row("hierarchical: step 1",
-            html.Div([
-                dcc.RadioItems(id=f"{prefix}-head",
-                               options=[{"label": " OLS", "value": "ols"},
-                                        {"label": " lasso",
-                                         "value": "lasso"},
-                                        {"label": " ridge",
-                                         "value": "ridge"}],
-                               value=defaults.get("head", "ols"), inline=True),
-                dcc.Input(id=f"{prefix}-halpha", type="text",
-                          value=defaults.get("halpha", "cv"),
-                          placeholder="step-1 alpha",
-                          style={"width": "70px"}),
-                dcc.Input(id=f"{prefix}-unpen", type="number",
-                          value=defaults.get("unpen", 1), min=1, max=8,
-                          step=1, style={"width": "55px"}),
-            ], style={"display": "flex", "gap": "6px",
-                      "alignItems": "center"}),
-            "estimator, penalty and number of leading columns for the "
-            "first stage. Only applies when the estimator is "
-            "hierarchical."),
-        row("hierarchical: step 2",
-            dcc.RadioItems(id=f"{prefix}-tail",
-                           options=[{"label": " lasso", "value": "lasso"},
-                                    {"label": " OLS", "value": "ols"},
-                                    {"label": " ridge", "value": "ridge"}],
-                           value=defaults.get("tail", "lasso"), inline=True),
-            "fitted to the first stage's residual, at the Lasso alpha above. "
-            "Sparse keeps only components that earn their place; OLS or "
-            "ridge use them all, which suits principal components, which do "
-            "not compete."),
-        row("stimulus-locked artifact",
-            dcc.RadioItems(id=f"{prefix}-stimart",
-                           options=[{"label": " off", "value": 0},
-                                    {"label": " on", "value": 1}],
-                           value=defaults.get("stimart", 0), inline=True),
-            "fits a square term (an optical artifact has no kinetics) and "
-            "keeps a kinetic term as the response; the isosbestic alone "
-            "cannot do this, because stray light is additive and motion is "
-            "multiplicative"),
-        row("blank laser frames",
-            dcc.RadioItems(id=f"{prefix}-blank",
-                           options=[{"label": " on", "value": 1},
-                                    {"label": " off", "value": 0}],
-                           value=defaults["blank"], inline=True)),
-        row("exposure (ms)",
-            dcc.Input(id=f"{prefix}-exp", type="number", value=8.5, step=0.1,
-                      style={"width": "100%"}),
-            "a physical property; the blanking test depends on it"),
-        html.Hr(),
-        row("peri-event baseline (s)",
-            dcc.Slider(id=f"{prefix}-base", min=0.1, max=4, step=0.1,
-                       value=defaults["base"],
-                       marks={0.5: "0.5", 1: "1", 2: "2", 4: "4"},
-                       tooltip={"placement": "bottom",
-                                "always_visible": True}),
-            "short windows are noisy: autocorrelation makes 20 samples "
-            "worth about 1.5 independent ones"),
-        row("response window (s)",
-            dcc.RangeSlider(id=f"{prefix}-resp", min=-1, max=5, step=0.1,
-                            value=defaults["resp"],
-                            marks={0: "0", 0.5: ".5", 1: "1", 2: "2",
-                                   4: "4"},
-                            tooltip={"placement": "bottom",
-                                     "always_visible": True})),
-        row("per-trial baseline",
-            dcc.RadioItems(id=f"{prefix}-detrend",
-                           options=[{"label": " mean", "value": "mean"},
-                                    {"label": " flanking line",
-                                     "value": "linear"}],
-                           value=defaults["detrend"], inline=True)),
-        row("combine trials",
-            dcc.RadioItems(id=f"{prefix}-stat",
-                           options=[{"label": " mean", "value": "mean"},
-                                    {"label": " median", "value": "median"}],
-                           value=defaults["stat"], inline=True)),
-        row("low-pass (Hz, 0 = off)",
-            dcc.Input(id=f"{prefix}-lp", type="number", value=0, step=0.5,
-                      style={"width": "100%"}),
-            "GCaMP6f cannot follow above ~5 Hz"),
-    ], style={"width": "300px", "padding": "10px",
-              "borderRight": "1px solid #ddd"})
+        html.H2(f"Variant {prefix}"),
+        group("Baseline", baseline, open_=True),
+        group("Motion correction", motion),
+        group("Laser artifact", artifact),
+        group("Peri-event windows", windows),
+    ], className=f"rail {prefix.lower()}")
 
 
 def main() -> int:
@@ -218,13 +403,16 @@ def main() -> int:
                     help="shifts per null; lower is faster, noisier p")
     args = ap.parse_args()
 
-    from multifiber.events import parse_session_name
+    from multifiber.events import format_duration, parse_session_name
 
     # The session is loaded on demand: the app opens whether or not one was
     # named on the command line, and a different one can be chosen without
     # restarting it.
     ST: dict = {"sd": None, "sites": [], "classes": [], "labels": {},
                 "hint": "", "cache": {}}
+    # Extraction runs on a worker thread so the page stays responsive; the
+    # log is appended to here and polled, rather than streamed.
+    RUN: dict = {"thread": None, "log": [], "done": False, "summary": None}
 
     def find_sessions(root):
         """Folders under ``root`` that look like processed sessions."""
@@ -251,21 +439,82 @@ def main() -> int:
                    if "protocol_class" in sd.events.columns else [])
 
         def class_label(c):
+            """Name a condition by what actually differs between them.
+
+            Duration alone is not enough: a session can interleave rates
+            inside one envelope, and three classes all labelled "1000 ms"
+            would be unreadable.
+            """
             g = sd.events[sd.events["protocol_class"] == c]
-            lab = f"{g['width_s'].median() * 1e3:.0f} ms"
+            dur = float(g["width_s"].median())
+            bits = [format_duration(dur)]
+            if "n_gate_pulses" in g.columns and g["n_gate_pulses"].notna().any():
+                npul = float(g["n_gate_pulses"].median())
+                if dur > 0 and npul > 1:
+                    bits.append(f"{npul / dur:.0f} Hz")
+            if "gate_duty" in g.columns and g["gate_duty"].notna().any():
+                bits.append(f"{float(g['gate_duty'].median()):.0%} on")
             if "command_v" in g.columns and g["command_v"].notna().any():
-                lab += f" / {g['command_v'].median():.3f} V"
-            return lab
+                bits.append(f"{float(g['command_v'].median()):.3f} V")
+            # keep only what distinguishes this class from the others
+            others = [cc for cc in classes if cc != c]
+            if others:
+                def feat(gg):
+                    d = float(gg["width_s"].median())
+                    return (round(d, 3),
+                            round(float(gg["n_gate_pulses"].median()) / d, 1)
+                            if "n_gate_pulses" in gg.columns and d > 0
+                            else None,
+                            round(float(gg["gate_duty"].median()), 3)
+                            if "gate_duty" in gg.columns else None,
+                            round(float(gg["command_v"].median()), 3)
+                            if "command_v" in gg.columns else None)
+                mine = feat(g)
+                theirs = [feat(sd.events[sd.events["protocol_class"] == cc])
+                          for cc in others]
+                keep = [i for i in range(len(mine))
+                        if any(t[i] != mine[i] for t in theirs)]
+                if keep:
+                    order = ["ms", "Hz", "on", "V"]
+                    kept = []
+                    for b in bits:
+                        tag = ("Hz" if b.endswith("Hz") else
+                               "on" if b.endswith("on") else
+                               "V" if b.endswith("V") else "ms")
+                        if any(order[i] == tag for i in keep):
+                            kept.append(b)
+                    bits = kept or bits
+            return " · ".join(bits) if bits else f"class {c}"
 
         labels_by_class = {c: class_label(c) for c in classes}
         hints = parse_session_name(sd.session_id)
         hint = ""
         if hints:
-            hint = f"name says {hints}"
-            if "n_protocols" in hints and classes:
-                ok = hints["n_protocols"] == len(classes)
-                hint += (f" — data give {len(classes)} condition(s)"
-                         + ("" if ok else "  ** MISMATCH **"))
+            named = hints.get("n_protocols")
+            hint = (f"{len(classes) or 1} condition"
+                    + ("" if (len(classes) or 1) == 1 else "s")
+                    + " measured from the laser channel")
+            if named and classes and named != len(classes):
+                hint += f", but the name says {named}"
+            # What it actually saw, so a disagreement is diagnosable rather
+            # than merely reported.
+            if classes:
+                hint += ": " + "; ".join(
+                    f"{labels_by_class[c]} x{int((sd.events['protocol_class'] == c).sum())}"
+                    for c in classes)
+            elif len(sd.events):
+                dur = float(sd.events["width_s"].median())
+                hint += (f": {len(sd.events)} events of "
+                         f"{format_duration(dur)}")
+            if named and classes and named != len(classes):
+                grouped = (sd.events["width_s"].median() > 2.0
+                           if len(sd.events) else False)
+                hint += (" — the pulses were grouped into long trains, so "
+                         "separate trials read as one condition; re-run with "
+                         "--group-bursts none"
+                         if grouped else
+                         " — check whether a condition was filtered out by "
+                         "the minimum pulse width")
         ST.update(sd=sd, sites=sites, classes=classes,
                   labels=labels_by_class, hint=hint, cache={})
         return (f"{sd.session_id}: {sd.n_roi} fibers, "
@@ -295,6 +544,7 @@ def main() -> int:
 
     app = Dash(__name__, suppress_callback_exceptions=True)
     app.title = "multifiber"
+    app.index_string = INDEX
 
     def session_ui():
         sd = ST["sd"]
@@ -305,10 +555,12 @@ def main() -> int:
             html.H3(sd.session_id, style={"margin": "4px 0"}),
             html.Div(hint_txt, style={"fontSize": "10px", "color": "#555"}),
         ], style={"padding": "6px", "borderBottom": "1px solid #ddd"}),
-        dcc.Tabs(id="tabs", value="compare", children=[
+        dcc.Tabs(id="tabs", value="compare", className="tab-bar",
+                 children=[
 
             # ---------------- preprocessing comparison ------------------- #
-            dcc.Tab(label="preprocessing", value="compare", children=[
+            dcc.Tab(label="Preprocessing", value="compare", className="tab",
+                    selected_className="tab--selected", children=[
                 html.Div([
                     html.Div("Variants are exploratory. Choose on a "
                              "diagnostic, not on the z-score: with twelve "
@@ -357,17 +609,15 @@ def main() -> int:
                                                   style={"height": "340px"})),
                             dcc.Loading(dcc.Graph(id="fig-dose",
                                                   style={"height": "230px"})),
-                            html.Pre(id="stats",
-                                     style={"fontSize": "11px",
-                                            "background": "#f7f7f7",
-                                            "padding": "8px"}),
-                        ], style={"flex": 1, "padding": "6px"}),
+                            html.Pre(id="stats", className="readout"),
+                        ], className="stage"),
                     ], style={"display": "flex"}),
                 ]),
             ]),
 
             # ---------------- all fibers at once ------------------------- #
-            dcc.Tab(label="all PETHs", value="grid", children=[
+            dcc.Tab(label="All fibers", value="grid", className="tab",
+                    selected_className="tab--selected", children=[
                 html.Div([
                     html.Div("Every recorded fiber under one set of "
                              "preprocessing choices. Panels share the time "
@@ -663,15 +913,177 @@ def main() -> int:
                         style={"overflowX": "auto"},
                         config={"toImageButtonOptions": {
                             "format": "svg", "filename": "peth_grid"}})),
-                    html.Pre(id="grid-stats",
-                             style={"fontSize": "11px",
-                                    "background": "#f7f7f7",
-                                    "padding": "8px"}),
+                    html.Pre(id="grid-stats", className="readout",
+                             style={"margin": "10px"}),
                 ]),
             ]),
 
+            # ---------------- extract ------------------------------------ #
+            dcc.Tab(label="Extract", value="extract", className="tab",
+                    selected_className="tab--selected", children=[
+                html.Div([
+                    html.Div([
+                        html.Div([
+                            html.Label("Session folder"),
+                            html.Div([
+                                dcc.Input(id="x-raw", type="text",
+                                          placeholder="folder of videos and "
+                                                      "DAQ logs",
+                                          style={"flex": 1}),
+                                html.Button("Browse", id="x-raw-btn",
+                                            className="quiet", n_clicks=0),
+                            ], style={"display": "flex", "gap": "6px"}),
+                            html.Div("Every session in this folder is "
+                                     "processed. The date in the folder name "
+                                     "picks the calibration.",
+                                     className="hint"),
+                        ], className="field"),
+                        html.Div([
+                            html.Label("Write results to"),
+                            html.Div([
+                                dcc.Input(id="x-out", type="text",
+                                          placeholder="output root",
+                                          style={"flex": 1}),
+                                html.Button("Browse", id="x-out-btn",
+                                            className="quiet", n_clicks=0),
+                            ], style={"display": "flex", "gap": "6px"}),
+                            html.Div("One folder per session, holding raw "
+                                     "traces, processed traces, events and a "
+                                     "manifest.", className="hint"),
+                        ], className="field"),
+                        html.Div([
+                            html.Label("Animal records"),
+                            html.Div([
+                                dcc.Input(id="x-reg", type="text",
+                                          placeholder="folder of "
+                                                      "<animal>.animal.yaml",
+                                          style={"flex": 1}),
+                                html.Button("Browse", id="x-reg-btn",
+                                            className="quiet", n_clicks=0),
+                            ], style={"display": "flex", "gap": "6px"}),
+                            html.Div("The fiber-to-region map. A session "
+                                     "whose animal has no record will not "
+                                     "run.", className="hint"),
+                        ], className="field"),
+                        html.Div([
+                            html.Label("Calibration files"),
+                            html.Div([
+                                dcc.Input(id="x-cal", type="text",
+                                          placeholder="shared calibration "
+                                                      "folder",
+                                          style={"flex": 1}),
+                                html.Button("Browse", id="x-cal-btn",
+                                            className="quiet", n_clicks=0),
+                            ], style={"display": "flex", "gap": "6px"}),
+                            html.Div("Searched after the session folder, so a "
+                                     "local copy wins.", className="hint"),
+                        ], className="field"),
+                    ], style={"width": "480px", "padding": "14px 18px"}),
+
+                    html.Div([
+                        html.Div([
+                            html.Div([
+                                html.Label("Exposure (ms)"),
+                                dcc.Input(id="x-exp", type="number",
+                                          value=8.5, step=0.1,
+                                          style={"width": "90px"}),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Baseline timescale (s)"),
+                                dcc.Input(id="x-tau", type="number", value=60,
+                                          step=5, style={"width": "90px"}),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Where F0 sits"),
+                                dcc.RadioItems(
+                                    id="x-method",
+                                    options=[{"label": " Lower envelope",
+                                              "value": "airpls"},
+                                             {"label": " Centre",
+                                              "value": "symmetric"}],
+                                    value="airpls"),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Isosbestic predictors"),
+                                dcc.RadioItems(
+                                    id="x-pred",
+                                    options=[{"label": " This fiber",
+                                              "value": "same"},
+                                             {"label": " Every fiber",
+                                              "value": "all"},
+                                             {"label": " Other fibers only",
+                                              "value": "others"},
+                                             {"label": " This fiber + others",
+                                              "value": "common"}],
+                                    value="common"),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Component from the others"),
+                                dcc.Dropdown(
+                                    id="x-common", value="median",
+                                    clearable=False,
+                                    options=([{"label": "Median",
+                                               "value": "median"}]
+                                             + [{"label": f"PC1-{k}" if k > 1
+                                                 else "PC1",
+                                                 "value": f"pc{k}"}
+                                                for k in range(1, 8)]),
+                                    style={"width": "170px"}),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Estimator"),
+                                dcc.RadioItems(
+                                    id="x-rmethod",
+                                    options=[{"label": " Lasso",
+                                              "value": "lasso"},
+                                             {"label": " Least squares",
+                                              "value": "ols"},
+                                             {"label": " Two stage",
+                                              "value": "hierarchical"}],
+                                    value="lasso"),
+                            ], className="field"),
+                            html.Div([
+                                html.Label("Already processed"),
+                                dcc.RadioItems(
+                                    id="x-force",
+                                    options=[{"label": " Skip", "value": 0},
+                                             {"label": " Process again",
+                                              "value": 1}],
+                                    value=0, inline=True),
+                                html.Div("Decoded video is reused either way "
+                                         "when the file and calibration are "
+                                         "unchanged.", className="hint"),
+                            ], className="field"),
+                        ], style={"padding": "14px 18px"}),
+                    ], style={"borderLeft": "1px solid var(--rule)",
+                              "width": "320px"}),
+
+                    html.Div([
+                        html.Div([
+                            html.Button("Extract", id="x-run", n_clicks=0),
+                            html.Span(id="x-state",
+                                      style={"marginLeft": "10px",
+                                             "fontSize": "12px",
+                                             "color": "var(--ink-soft)"}),
+                        ], style={"padding": "14px 18px 8px"}),
+                        dcc.Interval(id="x-tick", interval=900,
+                                     disabled=True),
+                        html.Pre(id="x-log", className="readout",
+                                 style={"margin": "0 18px 18px",
+                                        "maxHeight": "540px",
+                                        "overflowY": "auto",
+                                        "whiteSpace": "pre-wrap"},
+                                 children="Pick a session folder and an "
+                                          "output folder, then extract."),
+                    ], style={"flex": 1, "minWidth": 0,
+                              "borderLeft": "1px solid var(--rule)"}),
+                ], style={"display": "flex", "background": "var(--paper)",
+                          "alignItems": "stretch", "minHeight": "70vh"}),
+            ]),
+
             # ---------------- playback ----------------------------------- #
-            dcc.Tab(label="playback", value="play", children=[
+            dcc.Tab(label="Playback", value="play", className="tab",
+                    selected_className="tab--selected", children=[
                 html.Div([
                     html.Div("Raw (top) and processed (bottom) on a shared "
                              "clock, with the laser marked. The whole session "
@@ -893,26 +1305,27 @@ def main() -> int:
 
     app.layout = html.Div([
         html.Div([
-            html.H3("multifiber", style={"margin": "4px 8px"}),
-            html.Div([
-                dcc.Input(id="root-path", type="text",
-                          value=str(Path(args.root or
-                                         (args.session_dir or ".")).resolve()),
-                          placeholder="folder to search for sessions",
-                          style={"width": "520px"}),
-                html.Button("scan", id="scan-btn", n_clicks=0),
-                html.Button("browse…", id="browse-btn", n_clicks=0,
-                            title="open a folder picker on this machine"),
-                dcc.Dropdown(id="session-pick", placeholder="session",
-                             style={"width": "420px"}, clearable=False),
-                html.Button("open", id="open-btn", n_clicks=0),
-                html.Span(id="pick-msg", style={"fontSize": "11px",
-                                                "color": "#555"}),
-            ], style={"display": "flex", "gap": "8px", "alignItems": "center",
-                      "flexWrap": "wrap", "padding": "4px 8px"}),
-        ], style={"borderBottom": "1px solid #ddd"}),
+            html.H1("multifiber"),
+            html.Span("twelve fibers, one laser, one question at a time",
+                      className="note"),
+        ], className="bar"),
+        html.Div([
+            dcc.Input(id="root-path", type="text",
+                      value=str(Path(args.root or
+                                     (args.session_dir or ".")).resolve()),
+                      placeholder="folder holding processed sessions",
+                      style={"width": "460px"}),
+            html.Button("Browse", id="browse-btn", n_clicks=0,
+                        className="quiet"),
+            html.Button("Find sessions", id="scan-btn", n_clicks=0,
+                        className="quiet"),
+            dcc.Dropdown(id="session-pick", placeholder="session",
+                         style={"width": "380px"}, clearable=False),
+            html.Button("Open", id="open-btn", n_clicks=0),
+            html.Span(id="pick-msg", className="note"),
+        ], className="picker"),
         dcc.Loading(html.Div(id="session-ui")),
-    ])
+    ], className="bench")
 
     @app.callback(Output("root-path", "value"),
                   Input("browse-btn", "n_clicks"), prevent_initial_call=True)
@@ -943,10 +1356,11 @@ def main() -> int:
     def scan(_n, root):
         found = find_sessions(root or ".")
         if not found:
-            return [], None, (f"no processed sessions under {root!r} "
-                              "(looking for *_manifest.json)")
+            return [], None, ("nothing processed here yet — Extract makes "
+                              "sessions this can open")
         opts = [{"label": d.name, "value": str(d)} for d in found]
-        return opts, str(found[0]), f"{len(found)} session(s) found"
+        return opts, str(found[0]), (f"{len(found)} session"
+                                     + ("" if len(found) == 1 else "s"))
 
     @app.callback(Output("session-ui", "children"),
                   Input("open-btn", "n_clicks"),
@@ -954,14 +1368,25 @@ def main() -> int:
     def open_session(_n, path):
         target = path or args.session_dir
         if not target:
-            return html.Div("Pick a folder above, scan, and press open.",
-                            style={"padding": "20px", "color": "#777"})
+            return html.Div(
+                ["Nothing open yet. Point the bar above at a folder of "
+                 "processed sessions and press ",
+                 html.B("Find sessions"), ", or go to ", html.B("Extract"),
+                 " to make some."],
+                style={"padding": "28px 20px", "color": "var(--ink-soft)",
+                       "maxWidth": "60ch"})
         try:
             msg = load(target)
         except Exception as exc:
-            return html.Div(f"could not load {target}: "
-                            f"{type(exc).__name__}: {exc}",
-                            style={"padding": "20px", "color": "#a33"})
+            return html.Div(
+                [f"{Path(target).name} did not open. ",
+                 html.Span(f"{type(exc).__name__}: {exc}",
+                           className="caution"),
+                 html.Div("A processed session holds four files: raw traces, "
+                          "processed traces, events and a manifest. If any "
+                          "is missing, run the session through Extract "
+                          "again.", className="hint")],
+                style={"padding": "28px 20px", "maxWidth": "70ch"})
         print(msg)
         return session_ui()
 
@@ -1338,6 +1763,114 @@ def main() -> int:
             txt.append("\n(null bands off: z and p are not computed, and the "
                        "effects below cannot be judged without them)")
         return fig, "\n".join(txt)
+
+    # ---------------- extract ---------------------------------------------- #
+
+    def _pick_dir():
+        """Native folder picker, in a subprocess.
+
+        tkinter wants the main thread and Dash callbacks do not run there, so
+        it is started as its own process and the chosen path read back.
+        """
+        import subprocess
+        import sys as _sys
+
+        code = ("import tkinter as tk;from tkinter import filedialog;"
+                "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
+                "print(filedialog.askdirectory() or '')")
+        try:
+            out = subprocess.run([_sys.executable, "-c", code],
+                                 capture_output=True, text=True, timeout=600)
+            lines = (out.stdout or "").strip().splitlines()
+            return lines[-1] if lines and lines[-1] else dash_no_update
+        except Exception:
+            return dash_no_update
+
+    # Four identical pickers, registered in a loop. The callback body takes
+    # no closure over the loop variable, so there is nothing to capture late.
+    for _field in ("raw", "out", "reg", "cal"):
+        app.callback(Output(f"x-{_field}", "value"),
+                     Input(f"x-{_field}-btn", "n_clicks"),
+                     prevent_initial_call=True)(
+            lambda _n: _pick_dir())
+
+    @app.callback(Output("x-tick", "disabled"), Output("x-run", "disabled"),
+                  Output("x-state", "children"),
+                  Input("x-run", "n_clicks"),
+                  State("x-raw", "value"), State("x-out", "value"),
+                  State("x-reg", "value"), State("x-cal", "value"),
+                  State("x-exp", "value"), State("x-tau", "value"),
+                  State("x-method", "value"), State("x-pred", "value"),
+                  State("x-common", "value"), State("x-rmethod", "value"),
+                  State("x-force", "value"), prevent_initial_call=True)
+    def start_extract(_n, raw, out, reg, cal, exp, tau, method, pred,
+                      common, rmethod, force):
+        import threading
+
+        if RUN["thread"] is not None and RUN["thread"].is_alive():
+            return False, True, "already running"
+        missing = [n for n, v in (("session folder", raw),
+                                  ("output folder", out)) if not v]
+        if missing:
+            return True, False, f"needs a {missing[0]}"
+
+        RUN.update(thread=None, log=[], done=False, summary=None)
+
+        def say(msg):
+            RUN["log"].append(str(msg))
+
+        def work():
+            try:
+                from multifiber import PipelineConfig, process_directory
+
+                cfg = PipelineConfig(
+                    exposure_s=(float(exp) / 1e3 if exp else None),
+                    baseline_tau_s=float(tau or 60),
+                    baseline_method=method,
+                    regression_predictors=pred,
+                    isosbestic_common_method=common,
+                    regress_method=rmethod,
+                    show_progress=False)
+                say(f"Reading {raw}")
+                say(f"Writing to {out}")
+                _res, summary = process_directory(
+                    data_root=raw, out_root=out,
+                    registry_root=(reg or None),
+                    calibration_dir=(cal or None),
+                    config=cfg, force=bool(force), progress=say)
+                RUN["summary"] = summary
+                say("")
+                ok = int((summary["status"] == "ok").sum()) \
+                    if "status" in summary else len(summary)
+                say(f"Finished. {ok} of {len(summary)} session(s) processed.")
+                bad = (summary[summary["status"] != "ok"]
+                       if "status" in summary else summary.iloc[0:0])
+                for _, r in bad.iterrows():
+                    say(f"  {r.get('session_id', '?')}: {r.get('error', '')}")
+            except Exception as exc:
+                import traceback
+
+                say("")
+                say(f"Stopped: {type(exc).__name__}: {exc}")
+                say(traceback.format_exc(limit=3))
+            finally:
+                RUN["done"] = True
+
+        t = threading.Thread(target=work, daemon=True)
+        RUN["thread"] = t
+        t.start()
+        return False, True, "working"
+
+    @app.callback(Output("x-log", "children"), Output("x-state", "children",
+                                                      allow_duplicate=True),
+                  Output("x-run", "disabled", allow_duplicate=True),
+                  Output("x-tick", "disabled", allow_duplicate=True),
+                  Input("x-tick", "n_intervals"), prevent_initial_call=True)
+    def poll_extract(_n):
+        text = "\n".join(RUN["log"]) or "working"
+        if RUN["done"]:
+            return text, "done", False, True
+        return text, "working", True, False
 
     # ---------------- playback -------------------------------------------- #
     # The whole session is drawn once; playback moves only the x-range, and

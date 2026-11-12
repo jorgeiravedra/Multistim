@@ -383,7 +383,19 @@ def main() -> int:
                         sub = argparse.Namespace(**vars(args))
                         sub.protocol_class = c
                         g = _e[_e["protocol_class"] == c]
-                        lab = f"{g['width_s'].median()*1e3:.0f}ms"
+                        # Name a condition by what differs: a session can
+                        # interleave rates inside one envelope, and three
+                        # files all called "1000ms" would overwrite nothing
+                        # but confuse everything.
+                        from multifiber.events import format_duration
+                        _d = float(g["width_s"].median())
+                        lab = format_duration(_d).replace(" ", "")
+                        if ("n_gate_pulses" in g.columns
+                                and g["n_gate_pulses"].notna().any()
+                                and _d > 0):
+                            _r = float(g["n_gate_pulses"].median()) / _d
+                            if _r > 1:
+                                lab += f"_{_r:.0f}Hz"
                         if "command_v" in g.columns:
                             lab += f"_{g['command_v'].median():.3f}V"
                         sub.class_label = lab
@@ -506,7 +518,7 @@ def _run(args) -> int:
               + (f", {proto['pulses_per_burst']['median']:.0f} pulses each"
                  if "pulses_per_burst" in proto else "")
               + (f" at {rate:.1f} Hz" if rate else "")
-              + (f", burst {bd:.2f} s" if bd else "")
+              + (f", burst {bd:.3g} s" if bd else "")
               + (f", pulse {pw*1e3:.0f} ms" if pw else ""))
         if "duty_cycle" in proto:
             print(f"  duty cycle within burst: {proto['duty_cycle']:.1%}")
@@ -964,21 +976,31 @@ def _run(args) -> int:
         rows_pw = []
         for rec, sdm in per_rec.items():
             sd1 = float(sdm) * np.sqrt(max(n_ev_med, 1))
-            n_req = (tz * sd1 / tgt) ** 2 if tgt > 0 else np.inf
+            # At least one trial, and never fewer than it takes to have a
+            # trial mean at all. A fractional requirement means the effect is
+            # already far above this channel's noise.
+            n_req = max(1.0, (tz * sd1 / tgt) ** 2) if tgt > 0 else np.inf
             resolvable = tz * sdm
             mins = n_req * 10.0 / 60.0
             rows_pw.append({"recorded_site": rec, "single_trial_sd": sd1,
                             "resolvable_at_current_n": resolvable,
                             "n_required": n_req,
                             "target_effect": tgt, "target_z": tz})
+            ok = n_req <= n_ev_med
             print(f"  {rec:10s} {sd1:16.4%} {resolvable:14.3%} "
-                  f"{n_req:9.0f} {mins:16.0f} min")
+                  f"{n_req:9.0f} "
+                  + ("     already enough" if ok
+                     else f"{mins:16.0f} min"))
         pw = pd.DataFrame(rows_pw).sort_values("n_required")
         pw.to_csv(out / f"{sid}_power{suf}.csv", index=False)
 
         n_ok = int((pw["n_required"] <= n_ev_med).sum())
         print(f"\n  {n_ok}/{len(pw)} channel(s) can already resolve "
               f"{tgt:.2%} at n={n_ev_med}.")
+        if n_ok == len(pw):
+            print(f"  Every channel could have detected {tgt:.2%}. Its "
+                  "absence is therefore evidence about the perturbation, "
+                  "not about the sensitivity of the measurement.")
         med_req = float(pw["n_required"].median())
         print(f"  Median channel needs n={med_req:.0f}; the quietest needs "
               f"n={pw['n_required'].min():.0f}, the noisiest "

@@ -57,6 +57,9 @@ class VariantSpec:
     #: many leading columns it covers.
     head_method: str = "ols"
     head_alpha: "float | str" = "cv"
+    #: hierarchical only: estimator for the SECOND stage (the common
+    #: component or principal components, fitted to the head's residual).
+    tail_method: str = "lasso"
     unpenalized: int = 1
     #: add stimulus-locked square and kinetic regressors. The square absorbs
     #: an optical artifact (which has no kinetics); the kinetic term is
@@ -98,7 +101,7 @@ class VariantSpec:
             extra += f"/{self.regress_method}"
         if self.regress_method == "hierarchical":
             extra += (f"[{self.unpenalized}x{self.head_method}"
-                      f"@{self.head_alpha}]")
+                      f"@{self.head_alpha} -> {self.tail_method}]")
         if self.stim_artifact:
             extra += " +stim-artifact"
         return (f"tau={self.baseline_tau_s:g}s d={self.differences} "
@@ -205,6 +208,7 @@ def run_variant(sd: SessionData, spec: VariantSpec) -> VariantResult:
         regress_method=spec.regress_method,
         head_method=spec.head_method,
         head_alpha=spec.head_alpha,
+        tail_method=spec.tail_method,
         unpenalized=spec.unpenalized,
         stim_artifact=spec.stim_artifact,
         stim_decay_tau=spec.stim_decay_tau,
@@ -399,6 +403,7 @@ def tune_regression(
     methods: Sequence[str] = ("lasso", "ols", "hierarchical"),
     alphas: Sequence = ("cv", 1e-4, 1e-6),
     head_methods: Sequence[str] = ("ols", "lasso"),
+    tail_methods: Sequence[str] = ("lasso", "ols"),
     rois: Optional[Sequence[int]] = None,
     baseline_tau_s: float = 60.0,
     n_splits: int = 4,
@@ -440,10 +445,12 @@ def tune_regression(
     outside = ~in_stim
 
     seen, combos = set(), []
-    for pred, cm, meth, al, hm in itertools.product(
-            predictors, common_methods, methods, alphas, head_methods):
+    for pred, cm, meth, al, hm, tm in itertools.product(
+            predictors, common_methods, methods, alphas, head_methods,
+            tail_methods):
+        hier = meth == "hierarchical"
         key = (pred, cm if pred == "common" else "-", meth, str(al),
-               hm if meth == "hierarchical" else "-")
+               hm if hier else "-", tm if hier else "-")
         if key not in seen:
             seen.add(key)
             combos.append((key, al))
@@ -452,7 +459,7 @@ def tune_regression(
     rows, done, total = [], 0, len(rois) * len(combos)
     for j in rois:
         y = sig[:, j]
-        for (pred, cm, meth, al_s, hm), al in combos:
+        for (pred, cm, meth, al_s, hm, tm), al in combos:
             done += 1
             if progress is not None:
                 progress(done, total)
@@ -462,11 +469,14 @@ def tune_regression(
                     common_method=(cm if cm != "-" else "median"))
                 r, _ = pp.regress_isosbestic(
                     y, X, alpha=al, method=meth,
-                    head_method=(hm if hm != "-" else "ols"), unpenalized=1)
+                    head_method=(hm if hm != "-" else "ols"),
+                    tail_method=(tm if tm != "-" else "lasso"),
+                    unpenalized=1)
             except Exception as exc:
                 rows.append({"fiber": sd.labels[j], "predictors": pred,
                              "common": cm, "method": meth, "alpha": al_s,
-                             "head": hm, "error": type(exc).__name__})
+                             "head": hm, "tail": tm,
+                             "error": type(exc).__name__})
                 continue
 
             ok = np.isfinite(r) & np.isfinite(iso[:, j])
@@ -486,6 +496,7 @@ def tune_regression(
                     _, sub = pp.regress_isosbestic(
                         yo[tr], Xo[tr], alpha=al, method=meth,
                         head_method=(hm if hm != "-" else "ols"),
+                        tail_method=(tm if tm != "-" else "lasso"),
                         unpenalized=1)
                 except Exception:
                     continue
@@ -497,7 +508,7 @@ def tune_regression(
                      - (Xo[te] - Xo[tr].mean(axis=0)) @ c) ** 2)))
             rows.append({
                 "fiber": sd.labels[j], "predictors": pred, "common": cm,
-                "method": meth, "alpha": al_s, "head": hm,
+                "method": meth, "alpha": al_s, "head": hm, "tail": tm,
                 "r_stim": r_stim, "r_all": r_all,
                 "mse_out": float(np.mean(errs)) if errs else np.nan,
                 "resid_sd": float(np.nanstd(r)), "n_pred": int(X.shape[1])})

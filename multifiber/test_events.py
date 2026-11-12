@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import datetime as dt
 import numpy as np
 import pytest
 from scipy.io import savemat
@@ -384,7 +385,7 @@ def test_discovery_binds_animal_and_calibration(tmp_path):
     assert s.animal.animal_id == "derek"
     # most recent stamp at or before 2026-10-19
     assert s.calibration.path("translated_coords").name == "TranslatedCoords_100726.mat"
-    assert s.calibration.session_date_source == "path MMDDYY"
+    assert s.calibration.session_date_source.startswith("path MMDDYY")
     assert s.file_hashes()["calibration/translated_coords"]
     assert "video" in s.file_hashes()
 
@@ -2424,3 +2425,214 @@ def test_more_components_do_not_break_the_fit():
         r, info = pp.regress_isosbestic(y, X, alpha=1e-6)
         assert np.isfinite(r).all()
         assert np.std(r) < np.std(y)
+
+
+def test_hierarchical_tail_estimator_is_configurable():
+    """The second stage is a different question from the first: a sparse
+    tail keeps only components that earn their place, while OLS uses them
+    all, which suits principal components that are orthogonal anyway."""
+    rng = np.random.default_rng(0)
+    n, nroi = 6000, 12
+    a1 = np.convolve(rng.normal(0, 1, n + 300), np.ones(80) / 80, "same")[:n]
+    a2 = np.convolve(rng.normal(0, 1, n + 300), np.ones(25) / 25, "same")[:n]
+    a1, a2 = a1 / a1.std(), a2 / a2.std()
+    w1, w2 = rng.uniform(.5, 1.5, nroi), rng.uniform(-1, 1, nroi)
+    iso = np.stack([0.02 * (w1[j] * a1 + w2[j] * a2)
+                    + rng.normal(0, 0.004, n) for j in range(nroi)], 1)
+    y = 0.02 * (w1[0] * a1 + w2[0] * a2) + rng.normal(0, 0.003, n)
+    X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common",
+                                          common_method="pc3")
+    out = {}
+    for tm in ("lasso", "ols", "ridge"):
+        r, info = pp.regress_isosbestic(y, X, method="hierarchical",
+                                        head_method="ols", tail_method=tm,
+                                        alpha="cv", unpenalized=1)
+        out[tm] = abs(float(np.corrcoef(r, a2)[0, 1]))
+        assert info["tail_method"] == tm
+        assert tm in info["alpha_source"]
+    # an unpenalised tail uses every component, so it removes at least as
+    # much of the second source as the sparse one
+    assert out["ols"] <= out["lasso"] + 1e-6
+
+
+def test_signal_channel_is_the_brighter_state_not_the_commoner_one():
+    """The two LED states alternate, so their frame counts differ by at most
+    one. Identifying the signal channel by which state is more COMMON is
+    therefore a coin flip, and gets the 470 and 415 the wrong way round half
+    the time. The rule is brightness: GCaMP emits more under 470 than at the
+    isosbestic."""
+    tr, led, ft = _synth_session(n_frames=8001, n_roi=4)
+    counts = np.bincount(led)
+    assert abs(int(counts[0]) - int(counts[1])) <= 1   # nothing to choose on
+
+    means = {int(s): float(tr[led == s].mean()) for s in np.unique(led)}
+    by_bright = max(means, key=means.get)
+    dm = pp.demux_channels(tr, led, ft)
+    assert dm.signal.mean() == pytest.approx(
+        tr[led == by_bright].mean(), rel=1e-9)
+    assert dm.isosbestic.mean() == pytest.approx(
+        tr[led != by_bright].mean(), rel=1e-9)
+    assert dm.signal.mean() > dm.isosbestic.mean()
+
+
+def test_processed_timebase_matches_the_signal_frames():
+    """The playback draws raw and processed on a shared clock; they line up
+    only if the processed samples carry the signal frames' own times."""
+    tr, led, ft = _synth_session(n_frames=6000, n_roi=3)
+    dm = pp.demux_channels(tr, led, ft)
+    means = {int(s): float(tr[led == s].mean()) for s in np.unique(led)}
+    sig = led == max(means, key=means.get)
+    np.testing.assert_allclose(dm.signal_t, ft[sig])
+
+
+def test_session_date_prefers_the_directory_over_the_filename():
+    """A filename is typed by hand and is deeper in the path than the folder,
+    so searching every component together lets one transposed digit in a
+    stem override a correct directory -- and a date a decade off makes every
+    calibration file post-date the session."""
+    from multifiber import calibration as cal
+
+    p = Path(r"F:/data/testing/111226/ezra_3mWtest_3protsin1_111216.avi")
+    assert cal.session_date_from_dirname(p) == dt.date(2026, 11, 12)
+
+    # with no directory stamp, the filename is still used
+    q = Path(r"F:/data/testing/ezra_3mWtest_111226.avi")
+    assert cal.session_date_from_dirname(q) == dt.date(2026, 11, 12)
+
+
+def test_implausible_years_are_rejected():
+    """MMDDYY with a two-digit year is ambiguous; a session in 2016 is not a
+    date this rig ran on, and returning it silently leaves no calibration
+    eligible."""
+    from multifiber import calibration as cal
+
+    assert cal.session_date_from_dirname(
+        Path(r"F:/data/testing/111216/x_111216.avi")) is None
+    assert cal.session_date_from_dirname(
+        Path(r"F:/data/testing/102626/x.avi")) == dt.date(2026, 10, 26)
+
+
+def test_processed_traces_to_frame_has_what_the_readers_expect():
+    """The dff table is the input to every downstream script, and they find
+    ROI columns by excluding the known ones -- so a missing or extra column
+    silently changes which fibers get analysed."""
+    tr, led, ft = _synth_session(n_frames=4000, n_roi=3)
+    proc = pp.preprocess_traces(tr, led, ft, labels=["A", "B", "C"])
+    df = proc.to_frame()
+
+    assert len(df) == proc.n_samples
+    assert list(df.columns)[:2] == ["t", "frame"]
+    np.testing.assert_allclose(df["t"].to_numpy(), proc.t)
+    assert df["blanked"].dtype == bool
+    for c in ("A", "B", "C"):
+        assert c in df.columns and f"{c}__iso" in df.columns
+
+    rois = [c for c in df.columns
+            if c not in ("t", "frame", "blanked") and not c.endswith("__iso")]
+    assert rois == ["A", "B", "C"]
+
+
+def test_rates_inside_one_envelope_are_separate_conditions():
+    """Three rates in a one-second train share a duration, so duration alone
+    reports one condition and the interleaving is invisible. The gate
+    channel records the rate, so it does not have to be."""
+    n = 18
+    w = np.full(n, 1.0)
+    gp = np.r_[np.full(6, 10), np.full(6, 20), np.full(6, 40)]
+    duty = np.r_[np.full(6, 0.05), np.full(6, 0.10), np.full(6, 0.20)]
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w,
+                       np.full(n, 0.23), gp, duty, w * duty)
+    c = ev.classify_protocols(p, roi_id=np.ones(n, dtype=int))
+    assert np.unique(c).size == 3
+    for k in np.unique(c):
+        assert np.unique(gp[c == k]).size == 1      # one rate per class
+
+
+def test_pulse_width_at_one_rate_is_a_separate_condition():
+    n = 12
+    w = np.full(n, 1.0)
+    gp = np.full(n, 20)
+    duty = np.r_[np.full(6, 0.08), np.full(6, 0.16)]
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w,
+                       np.full(n, 0.23), gp, duty, w * duty)
+    assert np.unique(ev.classify_protocols(
+        p, roi_id=np.ones(n, dtype=int))).size == 2
+
+
+def test_one_protocol_stays_one_class_with_gate_features():
+    n = 12
+    w = np.full(n, 1.0)
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w,
+                       np.full(n, 0.23), np.full(n, 20), np.full(n, 0.08),
+                       w * 0.08)
+    assert np.unique(ev.classify_protocols(
+        p, roi_id=np.ones(n, dtype=int))).size == 1
+
+
+def test_protocol_classes_report_the_gate_rate():
+    n = 12
+    w = np.full(n, 1.0)
+    gp = np.r_[np.full(6, 10), np.full(6, 40)]
+    duty = np.r_[np.full(6, 0.05), np.full(6, 0.20)]
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w,
+                       np.full(n, 0.23), gp, duty, w * duty)
+    pr = ev.infer_protocol(p, p, roi_id=np.ones(n, dtype=int))
+    assert pr["n_protocol_classes"] == 2
+    rates = sorted(c["gate_rate_hz"] for c in pr["protocol_classes"])
+    assert rates == pytest.approx([10.0, 40.0], rel=0.05)
+
+
+def test_classification_splits_at_gaps_not_along_a_spread():
+    """Comparing each value with the first of its group makes the test
+    chain: a continuous spread wider than the tolerance gets cut wherever
+    the running total happens to cross it, turning measurement noise in the
+    gate duty into spurious conditions."""
+    rng = np.random.default_rng(0)
+    n = 40
+    w = np.full(n, 0.2)
+    duty = rng.normal(0.26, 0.04, n)          # one condition, measured
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w,
+                       np.full(n, 0.149), np.full(n, 16), duty, w * duty)
+    assert np.unique(ev.classify_protocols(
+        p, roi_id=np.ones(n, dtype=int))).size == 1
+
+
+def test_a_sham_and_two_durations_give_three_conditions():
+    """The design this was failing on: a 0.5 ms sham interleaved with 100
+    and 200 ms, one site, one power."""
+    rng = np.random.default_rng(0)
+    w = np.r_[np.full(45, 0.0005), np.full(45, 0.1), np.full(45, 0.2)]
+    gp = np.r_[np.full(45, 1), np.full(45, 8), np.full(45, 16)]
+    duty = np.r_[rng.normal(0.04, 0.006, 45), rng.normal(0.26, 0.03, 90)]
+    v = rng.normal(0.149, 0.002, 135)
+    p = ev.LaserPulses(np.arange(135) * 5.0, np.arange(135) * 5.0 + w, w, v,
+                       gp, duty, w * duty)
+    c = ev.classify_protocols(p, roi_id=np.ones(135, dtype=int))
+    assert np.unique(c).size == 3
+    for k in np.unique(c):
+        assert np.unique(np.round(w[c == k], 6)).size == 1
+
+
+def test_short_durations_are_not_rounded_away():
+    """A 0.5 ms sham labelled '0 ms' is both wrong and the condition whose
+    absence is hardest to notice."""
+    assert ev.format_duration(0.0005) == "0.50 ms"
+    assert ev.format_duration(0.0085) == "8.5 ms"
+    assert ev.format_duration(0.1) == "100 ms"
+    assert ev.format_duration(1.0) == "1 s"
+    assert ev.format_duration(0.0) == "?"
+
+
+def test_power_is_not_split_without_usable_roi_ids():
+    """Command voltage is per site; without a site it cannot be normalised,
+    and splitting on the raw value separates fibers rather than powers."""
+    n = 20
+    w = np.full(n, 0.2)
+    v = np.r_[np.full(10, 0.149), np.full(10, 0.224)]
+    p = ev.LaserPulses(np.arange(n) * 5.0, np.arange(n) * 5.0 + w, w, v,
+                       np.full(n, 16), np.full(n, 0.26), w * 0.26)
+    assert np.unique(ev.classify_protocols(p, roi_id=None)).size == 1
+    bad = np.zeros(n, dtype=int)           # unassigned
+    assert np.unique(ev.classify_protocols(p, roi_id=bad)).size == 1
+    good = np.ones(n, dtype=int)
+    assert np.unique(ev.classify_protocols(p, roi_id=good)).size == 2

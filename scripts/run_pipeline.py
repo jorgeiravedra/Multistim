@@ -56,8 +56,21 @@ def main() -> int:
                          "the solves are small and thread contention has been "
                          "the larger risk)")
     ap.add_argument("--allow-duplicate-omp", action="store_true", default=True)
+    ap.add_argument("--min-width", type=float, default=None,
+                    help="shortest laser pulse to accept, in seconds "
+                         "(default 0.0015). A protocol with pulses shorter "
+                         "than this loses that whole condition: the pulses "
+                         "are discarded before anything else sees them, and "
+                         "the only sign is stim-log entries with no match.")
+    ap.add_argument("--group-bursts", default=None,
+                    help="'auto' finds the gap between pulses of one train "
+                         "and the gap between trains; 'none' treats every "
+                         "pulse as its own trial; a number is the gap in "
+                         "seconds. Use 'none' when single pulses ARE the "
+                         "trials, or auto will merge trials into bursts.")
     ap.add_argument("--baseline-tau-s", type=float, default=60.0)
-    ap.add_argument("--predictors", choices=("same", "all", "common"), default="common",
+    ap.add_argument("--predictors", choices=("same", "all", "common", "others"),
+                    default="common",
                     help="motion regressors: 'same' uses only that fiber's "
                          "isosbestic, 'all' every fiber's separately, "
                          "'common' the fiber's own plus a noise-averaged "
@@ -108,6 +121,12 @@ def main() -> int:
                          "picks per fiber by out-of-sample error on held-out "
                          "blocks, scored outside the stimulation windows so "
                          "the choice cannot be influenced by the response.")
+    ap.add_argument("--tail-method",
+                    choices=("lasso", "ols", "ridge"), default="lasso",
+                    help="hierarchical only: estimator for the second stage. "
+                         "lasso keeps only components that earn their place; "
+                         "ols and ridge use them all, which suits principal "
+                         "components that are orthogonal anyway.")
     ap.add_argument("--stim-artifact", action="store_true",
                     help="add stimulus-locked square and kinetic regressors. "
                          "The square term absorbs an optical artifact, which "
@@ -150,6 +169,14 @@ def main() -> int:
                          common_mode=args.common_mode,
                          baseline_mode=args.baseline_mode,
                          baseline_method=args.baseline_method,
+                         **({"laser_min_width_s": args.min_width}
+                            if args.min_width is not None else {}),
+                         **({"group_bursts": (
+                             None if str(args.group_bursts).lower() == "none"
+                             else args.group_bursts
+                             if args.group_bursts == "auto"
+                             else float(args.group_bursts))}
+                            if args.group_bursts is not None else {}),
                          isosbestic_common_method=args.common_method,
                          regress_method=args.regress_method,
                          stim_artifact_regression=args.stim_artifact)
