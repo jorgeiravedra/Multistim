@@ -31,7 +31,7 @@ from . import events as ev
 from . import matio
 from . import preprocess as pp
 
-__all__ = ["VariantSpec", "SessionData", "load_session", "run_variant",
+__all__ = ["VariantSpec", "tune_regression", "isosbestic_dff", "SessionData", "load_session", "run_variant",
            "peri_event", "shift_null", "VariantResult"]
 
 
@@ -51,6 +51,18 @@ class VariantSpec:
     predictors: str = "common"              # same | all | common
     common_method: str = "median"           # median | pc1
     alpha: "float | str" = "cv"
+    #: estimator: lasso | ols | ridge | hierarchical | auto (per fiber)
+    regress_method: str = "lasso"
+    #: hierarchical only: estimator and penalty for the FIRST stage, and how
+    #: many leading columns it covers.
+    head_method: str = "ols"
+    head_alpha: "float | str" = "cv"
+    unpenalized: int = 1
+    #: add stimulus-locked square and kinetic regressors. The square absorbs
+    #: an optical artifact (which has no kinetics); the kinetic term is
+    #: estimated and kept as the response.
+    stim_artifact: bool = False
+    stim_decay_tau: float = 0.4
 
     # artifact
     blank_laser: bool = True
@@ -81,9 +93,17 @@ class VariantSpec:
                        else ""))
         lam = ("auto" if self.lambda_override is None
                else f"{self.lambda_override:.2e}")
+        extra = ""
+        if self.regress_method != "lasso":
+            extra += f"/{self.regress_method}"
+        if self.regress_method == "hierarchical":
+            extra += (f"[{self.unpenalized}x{self.head_method}"
+                      f"@{self.head_alpha}]")
+        if self.stim_artifact:
+            extra += " +stim-artifact"
         return (f"tau={self.baseline_tau_s:g}s d={self.differences} "
                 f"{self.baseline_method} lam={lam} | iso={reg} "
-                f"alpha={self.alpha} | blank={'on' if self.blank_laser else 'off'}"
+                f"alpha={self.alpha}{extra} | blank={'on' if self.blank_laser else 'off'}"
                 f" | base={self.baseline_window_s:g}s "
                 f"resp={self.response_start_s:g}-"
                 f"{self.response_start_s + self.response_window_s:g}s "
@@ -182,6 +202,12 @@ def run_variant(sd: SessionData, spec: VariantSpec) -> VariantResult:
         common_method=spec.common_method,
         regress=spec.regress,
         blank_pad=spec.blank_pad,
+        regress_method=spec.regress_method,
+        head_method=spec.head_method,
+        head_alpha=spec.head_alpha,
+        unpenalized=spec.unpenalized,
+        stim_artifact=spec.stim_artifact,
+        stim_decay_tau=spec.stim_decay_tau,
     )
     dff = out.dff
 
@@ -336,3 +362,161 @@ def compare(res: VariantResult, onsets: np.ndarray, roi: int,
     p = (1.0 + int(np.sum(np.abs(nl["effects"] - nl["mean"])
                           >= abs(pe["effect"] - nl["mean"])))) / (nl["n"] + 1.0)
     return {**pe, "null": nl, "z": z, "p": p}
+
+
+def isosbestic_dff(sd: "SessionData", baseline_tau_s: float = 60.0,
+                   differences: int = 2) -> tuple:
+    """Signal and isosbestic dF/F on a common timebase, without regression.
+
+    Both channels get identical baseline treatment, so the two are
+    comparable and only the regression differs between configurations.
+    """
+    dm = pp.demux_channels(sd.traces, sd.led_state, sd.frame_t,
+                           labels=sd.labels)
+    t = dm.signal_t
+    fs = 1.0 / float(np.median(np.diff(t)))
+    lam = pp.lambda_from_timescale(baseline_tau_s, fs, differences)
+    n_roi = dm.signal.shape[1]
+    sig = np.column_stack([
+        pp.compute_dff(dm.signal[:, j],
+                       pp.estimate_f0(dm.signal[:, j], lambda_=lam,
+                                      differences=differences))
+        for j in range(n_roi)])
+    iso_on_sig = np.column_stack([
+        np.interp(t, dm.isos_t, dm.isosbestic[:, j]) for j in range(n_roi)])
+    iso = np.column_stack([
+        pp.compute_dff(iso_on_sig[:, j],
+                       pp.estimate_f0(iso_on_sig[:, j], lambda_=lam,
+                                      differences=differences))
+        for j in range(n_roi)])
+    return t, sig, iso
+
+
+def tune_regression(
+    sd: "SessionData",
+    predictors: Sequence[str] = ("same", "common", "others", "all"),
+    common_methods: Sequence[str] = ("median", "pc1", "pc2"),
+    methods: Sequence[str] = ("lasso", "ols", "hierarchical"),
+    alphas: Sequence = ("cv", 1e-4, 1e-6),
+    head_methods: Sequence[str] = ("ols", "lasso"),
+    rois: Optional[Sequence[int]] = None,
+    baseline_tau_s: float = 60.0,
+    n_splits: int = 4,
+    progress=None,
+):
+    """Grid search the regression per fiber, scored on the isosbestic.
+
+    The criterion comes from the 415 channel rather than from an assumed
+    response shape.  If the isosbestic is what defines an artifact, a good
+    fit leaves no 415-correlated structure in the 470 residual -- including
+    inside the stimulation windows, which is where a stimulus-locked
+    artifact lives.
+
+    ``r_stim``
+        |corr(470 residual, own 415)| inside the stimulation windows. The
+        quantity to minimise.
+    ``mse_out``
+        Out-of-sample squared error on held-out blocks, scored outside the
+        stimulation windows. A guard: a configuration that scrubs the
+        stimulus window by fitting noise everywhere else is not a better
+        fit, and this catches it.
+
+    Ranking on ``r_stim`` alone rewards overfitting; ranking on ``mse_out``
+    alone is what the automatic per-fiber selector does, and it has no
+    reason to care about the artifact. Both are returned so the trade can be
+    seen rather than assumed.
+    """
+    import itertools
+
+    import pandas as pd
+    from sklearn.model_selection import TimeSeriesSplit
+
+    t, sig, iso = isosbestic_dff(sd, baseline_tau_s=baseline_tau_s)
+    in_stim = np.zeros(t.size, dtype=bool)
+    if len(sd.events):
+        for a, b in zip(sd.events["onset_t"].to_numpy(float),
+                        sd.events["offset_t"].to_numpy(float)):
+            in_stim |= (t >= a) & (t <= b)
+    outside = ~in_stim
+
+    seen, combos = set(), []
+    for pred, cm, meth, al, hm in itertools.product(
+            predictors, common_methods, methods, alphas, head_methods):
+        key = (pred, cm if pred == "common" else "-", meth, str(al),
+               hm if meth == "hierarchical" else "-")
+        if key not in seen:
+            seen.add(key)
+            combos.append((key, al))
+
+    rois = list(range(sig.shape[1])) if rois is None else list(rois)
+    rows, done, total = [], 0, len(rois) * len(combos)
+    for j in rois:
+        y = sig[:, j]
+        for (pred, cm, meth, al_s, hm), al in combos:
+            done += 1
+            if progress is not None:
+                progress(done, total)
+            try:
+                X, _ = pp.build_isosbestic_predictors(
+                    iso, j, mode=pred,
+                    common_method=(cm if cm != "-" else "median"))
+                r, _ = pp.regress_isosbestic(
+                    y, X, alpha=al, method=meth,
+                    head_method=(hm if hm != "-" else "ols"), unpenalized=1)
+            except Exception as exc:
+                rows.append({"fiber": sd.labels[j], "predictors": pred,
+                             "common": cm, "method": meth, "alpha": al_s,
+                             "head": hm, "error": type(exc).__name__})
+                continue
+
+            ok = np.isfinite(r) & np.isfinite(iso[:, j])
+            m_in = ok & in_stim
+            r_stim = (abs(float(np.corrcoef(r[m_in], iso[m_in, j])[0, 1]))
+                      if m_in.sum() > 20 else np.nan)
+            r_all = (abs(float(np.corrcoef(r[ok], iso[ok, j])[0, 1]))
+                     if ok.sum() > 20 else np.nan)
+
+            errs = []
+            Xo, yo, out_o = X[ok], y[ok], outside[ok]
+            for tr, te in TimeSeriesSplit(n_splits=n_splits).split(Xo):
+                te = te[out_o[te]]
+                if te.size < 20 or tr.size < 50:
+                    continue
+                try:
+                    _, sub = pp.regress_isosbestic(
+                        yo[tr], Xo[tr], alpha=al, method=meth,
+                        head_method=(hm if hm != "-" else "ols"),
+                        unpenalized=1)
+                except Exception:
+                    continue
+                c = np.asarray(sub["coefficients"], dtype=float).ravel()
+                if c.size != Xo.shape[1]:
+                    continue
+                errs.append(float(np.mean(
+                    (yo[te] - yo[tr].mean()
+                     - (Xo[te] - Xo[tr].mean(axis=0)) @ c) ** 2)))
+            rows.append({
+                "fiber": sd.labels[j], "predictors": pred, "common": cm,
+                "method": meth, "alpha": al_s, "head": hm,
+                "r_stim": r_stim, "r_all": r_all,
+                "mse_out": float(np.mean(errs)) if errs else np.nan,
+                "resid_sd": float(np.nanstd(r)), "n_pred": int(X.shape[1])})
+    return pd.DataFrame(rows)
+
+
+def pick_winners(df, mse_tolerance: float = 0.05):
+    """Lowest r_stim among configurations within tolerance of the best MSE."""
+    import pandas as pd
+
+    out = []
+    for fib, g in df.dropna(subset=["r_stim"]).groupby("fiber", sort=False):
+        ok = g.dropna(subset=["mse_out"])
+        if len(ok):
+            lim = ok["mse_out"].min() * (1 + mse_tolerance)
+            cand = ok[ok["mse_out"] <= lim]
+        else:
+            cand = g
+        best = cand.loc[cand["r_stim"].idxmin()].copy()
+        best["r_stim_worst"] = float(g["r_stim"].max())
+        out.append(best)
+    return pd.DataFrame(out)

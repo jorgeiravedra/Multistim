@@ -54,6 +54,27 @@ def main() -> int:
     ap.add_argument("--no-blank-laser", action="store_true")
     ap.add_argument("--blank-pad", type=int, default=None)
     ap.add_argument("--smooth", type=int, default=None)
+    ap.add_argument("--regress-method",
+                    choices=("lasso", "ols", "ridge", "hierarchical",
+                             "auto"),
+                    default=None,
+                    help="estimator for the motion regression. lasso is "
+                         "non-negative and sparse; ols fits every predictor "
+                         "fully, which a brief artifact needs; hierarchical "
+                         "fits the own fiber unpenalized first; auto "
+                         "picks per fiber by out-of-sample error on held-out "
+                         "blocks, scored outside the stimulation windows so "
+                         "the choice cannot be influenced by the response.")
+    ap.add_argument("--stim-artifact", action="store_true",
+                    help="add stimulus-locked square and kinetic regressors. "
+                         "The square term absorbs an optical artifact, which "
+                         "has no kinetics; the kinetic term is estimated and "
+                         "kept as the response.")
+    ap.add_argument("--common-method", choices=("median", "pc1", "pc2", "pc3", "pc4", "pc5",
+                             "pc6", "pc7"),
+                    default=None,
+                    help="common isosbestic component: median, or pcN "
+                         "for the first N principal components")
     ap.add_argument("--baseline-method",
                     choices=("airpls", "symmetric"), default=None)
     ap.add_argument("--dry-run", action="store_true",
@@ -94,6 +115,9 @@ def main() -> int:
         over = {
             "baseline_mode": args.baseline_mode,
             "baseline_method": args.baseline_method,
+            "isosbestic_common_method": args.common_method,
+            "regress_method": args.regress_method,
+            "stim_artifact_regression": (True if args.stim_artifact else None),
             "baseline_tau_s": args.baseline_tau_s,
             "airpls_differences": args.airpls_differences,
             "guard_s": args.guard_s,
@@ -165,6 +189,7 @@ def main() -> int:
                 differences=cfg.airpls_differences,
                 baseline_mode=cfg.baseline_mode,
                 baseline_method=cfg.baseline_method,
+                common_method=cfg.isosbestic_common_method,
                 guard_s=cfg.guard_s,
                 alpha=cfg.regression_alpha,
                 predictors=cfg.regression_predictors,

@@ -97,6 +97,35 @@ def main() -> int:
                          "session) or separately per baseline/stim/post "
                          "epoch (for assays with a genuine regime change, "
                          "e.g. intruder introduction).")
+    ap.add_argument("--regress-method",
+                    choices=("lasso", "ols", "ridge", "hierarchical",
+                             "auto"),
+                    default="lasso",
+                    help="estimator for the motion regression. lasso is "
+                         "non-negative and sparse; ols fits every predictor "
+                         "fully, which a brief artifact needs; hierarchical "
+                         "fits the own fiber unpenalized first; auto "
+                         "picks per fiber by out-of-sample error on held-out "
+                         "blocks, scored outside the stimulation windows so "
+                         "the choice cannot be influenced by the response.")
+    ap.add_argument("--stim-artifact", action="store_true",
+                    help="add stimulus-locked square and kinetic regressors. "
+                         "The square term absorbs an optical artifact, which "
+                         "has no kinetics; the kinetic term is estimated and "
+                         "kept as the response.")
+    ap.add_argument("--common-method", choices=("median", "pc1", "pc2", "pc3", "pc4", "pc5",
+                             "pc6", "pc7"),
+                    default="median",
+                    help="how the common isosbestic component is built when "
+                         "--predictors common: 'median' is robust to one odd "
+                         "fiber, 'pc1' is optimal if the artifact is a single "
+                         "waveform scaled differently in each fiber, "
+                         "and pc2/pc3 allow for several independent sources "
+                         "(bundle bending, connector play, LED drift) that "
+                         "project onto different directions. Each component "
+                         "is another coefficient fitted from the same data, "
+                         "so judge it on the detection floor, not on R^2, "
+                         "which rises with any added predictor.")
     ap.add_argument("--baseline-method",
                     choices=("airpls", "symmetric"), default="airpls",
                     help="airpls fits the lower envelope, so dF/F is "
@@ -120,7 +149,10 @@ def main() -> int:
                          show_progress=not args.quiet,
                          common_mode=args.common_mode,
                          baseline_mode=args.baseline_mode,
-                         baseline_method=args.baseline_method)
+                         baseline_method=args.baseline_method,
+                         isosbestic_common_method=args.common_method,
+                         regress_method=args.regress_method,
+                         stim_artifact_regression=args.stim_artifact)
     results, summary = process_directory(
         data_root=args.data_root,
         out_root=args.out_root,

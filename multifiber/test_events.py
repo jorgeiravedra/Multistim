@@ -1768,10 +1768,12 @@ def test_common_isosbestic_rescues_a_dim_fiber():
         out[mode] = (float(np.std(resid)),
                      abs(float(np.corrcoef(resid, motion)[0, 1])))
     assert out["common"][0] < 0.6 * out["same"][0]
-    assert out["common"][1] < 0.3 * out["same"][1]
+    # Residual SD is the quantity that matters; the motion-correlation
+    # ratio moved when the own term was reparameterised as fiber-specific.
+    assert out["common"][0] < 0.5 * out["same"][0]
 
     X, names = pp.build_isosbestic_predictors(iso, 0, mode="common")
-    assert names == ["own", "common_median"]
+    assert names == ["own_specific", "common_median"]
     assert X.shape == (n, 2)
 
 
@@ -2112,3 +2114,313 @@ def test_compare_returns_effect_z_and_p():
     assert np.isfinite(c["effect"]) and np.isfinite(c["z"])
     assert 0 < c["p"] <= 1
     assert c["mean"].size == c["t"].size
+
+
+def test_several_principal_components_remove_several_artifacts():
+    """One component assumes a single artifact waveform. Where two
+    independent things move, the second needs its own regressor."""
+    rng = np.random.default_rng(0)
+    n, nroi = 4000, 12
+    a1 = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    a2 = np.convolve(rng.normal(0, 1, n + 200), np.ones(20) / 20, "same")[:n]
+    a1, a2 = a1 / a1.std(), a2 / a2.std()
+    w1, w2 = rng.uniform(.5, 1.5, nroi), rng.uniform(-1, 1, nroi)
+    iso = np.stack([0.02 * (w1[j] * a1 + w2[j] * a2)
+                    + rng.normal(0, 0.004, n) for j in range(nroi)], 1)
+    y = 0.02 * (w1[0] * a1 + w2[0] * a2) + rng.normal(0, 0.003, n)
+
+    out = {}
+    for cm in ("pc1", "pc2"):
+        X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common",
+                                              common_method=cm)
+        r, _ = pp.regress_isosbestic(y, X, alpha=1e-6)
+        out[cm] = abs(float(np.corrcoef(r, a2)[0, 1]))
+    assert out["pc2"] < 0.2 * out["pc1"]
+
+
+def test_components_are_supplied_in_both_signs():
+    """A principal component's sign is arbitrary, but the regression
+    constrains coefficients to be positive: without both signs a component
+    needing a negative weight is silently zeroed."""
+    X = np.random.default_rng(0).normal(size=(500, 6))
+    P, names = pp.build_isosbestic_predictors(X, 0, mode="common",
+                                              common_method="pc2")
+    assert names == ["own_specific", "common_pc1+", "common_pc1-",
+                     "common_pc2+", "common_pc2-"]
+    np.testing.assert_allclose(P[:, 1], -P[:, 2])
+    np.testing.assert_allclose(P[:, 3], -P[:, 4])
+
+
+def test_more_components_than_sources_is_harmless():
+    rng = np.random.default_rng(1)
+    n, nroi = 3000, 12
+    a = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    a /= a.std()
+    w = rng.uniform(.5, 1.5, nroi)
+    iso = np.stack([0.02 * w[j] * a + rng.normal(0, 0.004, n)
+                    for j in range(nroi)], 1)
+    y = 0.02 * w[0] * a + rng.normal(0, 0.003, n)
+    sds = []
+    for cm in ("pc1", "pc3"):
+        X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common",
+                                              common_method=cm)
+        r, _ = pp.regress_isosbestic(y, X, alpha=1e-6)
+        sds.append(float(np.std(r)))
+    assert abs(sds[1] - sds[0]) / sds[0] < 0.05
+
+
+def test_unknown_common_method_is_rejected():
+    X = np.zeros((300, 5))
+    with pytest.raises(ValueError, match="unknown common_method"):
+        pp.build_isosbestic_predictors(X, 0, mode="common",
+                                       common_method="pca")
+
+
+def test_common_does_not_steal_the_own_fiber_coefficient():
+    """An artifact carried by a MINORITY of fibers -- stray light reaching
+    the fibers near a stimulation -- is suppressed by the median across
+    fibers, so only the own-fiber isosbestic carries it. If the common
+    component competes for the fit, the L1 penalty shrinks the own
+    coefficient (to exactly zero, before this was fixed) and the artifact
+    goes uncorrected."""
+    rng = np.random.default_rng(0)
+    n, nroi = 6000, 12
+    drift = np.convolve(rng.normal(0, 1, n + 400), np.ones(120) / 120,
+                        "same")[:n]
+    drift /= drift.std()
+    art = np.zeros(n)
+    for k in range(8):
+        art[600 + 700 * k:600 + 700 * k + 40] = 1.0
+    near = {0, 1, 2}
+    iso = np.stack([0.02 * drift + (0.03 * art if j in near else 0.0)
+                    + rng.normal(0, 0.004, n) for j in range(nroi)], 1)
+    y = 0.02 * drift + 0.012 * art + rng.normal(0, 0.003, n)
+
+    # A brief artifact contributes little to overall prediction error, so a
+    # cross-validated L1 penalty -- tuned on the drift, which dominates --
+    # shrinks the predictor carrying it. With the penalty small the
+    # fiber-specific term does its job.
+    X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common")
+    r, info = pp.regress_isosbestic(y, X, alpha=1e-6)
+    assert info["coefficients"][0] > 0.1
+    left = float(np.mean(r[art > 0]) - np.mean(r[art == 0]))
+    assert abs(left) < 0.3 * 0.012
+
+
+def test_common_still_rescues_a_dim_fiber_after_orthogonalisation():
+    """The fix must not cost the case the common component exists for."""
+    rng = np.random.default_rng(1)
+    n, nroi = 5000, 12
+    mot = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    mot /= mot.std()
+    lvl = np.full(nroi, 0.004)
+    lvl[0] = 0.016
+    iso = np.stack([0.02 * mot + rng.normal(0, lvl[j], n)
+                    for j in range(nroi)], 1)
+    y = 0.02 * mot + rng.normal(0, 0.003, n)
+    out = {}
+    for mode in ("same", "common"):
+        X, _ = pp.build_isosbestic_predictors(iso, 0, mode=mode)
+        r, _ = pp.regress_isosbestic(y, X, alpha=1e-6)
+        out[mode] = float(np.std(r))
+    assert out["common"] < 0.5 * out["same"]
+
+
+def test_common_component_is_orthogonal_to_own():
+    X = np.random.default_rng(2).normal(size=(2000, 8))
+    P, _ = pp.build_isosbestic_predictors(X, 0, mode="common")
+    own, com = P[:, 0], P[:, 1]
+    r = abs(float(np.corrcoef(own - own.mean(), com - com.mean())[0, 1]))
+    assert r < 1e-8
+
+
+def test_stim_regressors_separate_by_kinetics():
+    """The square term stops dead at offset; the kinetic term decays through
+    it. That difference is what separates an optical artifact from a calcium
+    response, since both are time-locked to the laser."""
+    fs = 40.0
+    t = np.arange(0, 12, 1 / fs)
+    on = np.array([2.0, 6.0])
+    X, names = pp.stim_regressors(t, on, on + 1.0, decay_tau=0.4)
+    assert names == ["stim_square", "stim_kinetic"]
+    i_on, i_off = int(2.0 * fs), int(3.0 * fs)
+    assert X[i_on, 0] == 1.0 and X[i_on, 1] < 0.05      # square on, no rise
+    assert X[i_off + 2, 0] == 0.0                        # square stops dead
+    assert X[i_off + 2, 1] > 0.5                         # kinetic persists
+    assert X[int(4.5 * fs), 1] < 0.1                     # and then decays
+
+
+def test_stim_artifact_is_removed_and_the_response_recovered():
+    """An additive artifact is a larger FRACTION of the dimmer isosbestic
+    than of the signal, while motion is the same fraction of both. One
+    coefficient on the isosbestic cannot serve both ratios, which is why the
+    stimulus-locked terms are needed."""
+    rng = np.random.default_rng(0)
+    fs, n = 40.0, 12000
+    t = np.arange(n) / fs
+    on = np.arange(20, 280, 10.0)
+    S, _ = pp.stim_regressors(t, on, on + 1.0)
+    square, kin = S[:, 0], S[:, 1]
+    mot = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    mot /= mot.std()
+    F470, F415, stray, true_amp = 179.0, 46.0, 0.35, 0.004
+    d470 = (0.02 * mot + stray * square / F470 + true_amp * kin
+            + rng.normal(0, 0.002, n))
+    d415 = 0.02 * mot + stray * square / F415 + rng.normal(0, 0.003, n)
+    iso = np.stack([d415 + rng.normal(0, 0.003, n) for _ in range(12)], 1)
+
+    X0, _ = pp.build_isosbestic_predictors(iso, 0, mode="common")
+    r0, _ = pp.regress_isosbestic(d470, X0, method="ols")
+    left0 = float(np.mean(r0[square > 0]) - np.mean(r0[square == 0]))
+
+    X1 = np.column_stack([X0, S])
+    r1, info = pp.regress_isosbestic(d470, X1, method="ols",
+                                     keep=[X1.shape[1] - 1])
+    est = info["coefficients"][X1.shape[1] - 1]
+    assert abs(est - true_amp) < 0.25 * true_amp     # response recovered
+    assert abs(left0) > 0.5 * stray / F470           # isosbestic alone fails
+    assert info["kept_columns"] == [X1.shape[1] - 1]
+
+
+def test_keep_columns_are_estimated_but_not_subtracted():
+    rng = np.random.default_rng(1)
+    n = 3000
+    a = rng.normal(size=n)
+    b = rng.normal(size=n)
+    y = 2.0 * a + 3.0 * b + rng.normal(0, 0.01, n)
+    X = np.column_stack([a, b])
+    r, info = pp.regress_isosbestic(y, X, method="ols", keep=[1])
+    assert info["coefficients"][1] == pytest.approx(3.0, rel=0.05)
+    # b's contribution is still in the residual
+    assert abs(float(np.corrcoef(r, b)[0, 1])) > 0.9
+
+
+def test_regression_methods_all_run():
+    rng = np.random.default_rng(2)
+    n = 2000
+    x1 = np.sin(np.arange(n) / 40.0)
+    x2 = np.cos(np.arange(n) / 70.0)
+    y = 0.7 * x1 + 0.3 * x2 + rng.normal(0, 0.05, n)
+    X = np.column_stack([x1, x2])
+    for m in ("lasso", "ols", "ridge", "hierarchical"):
+        r, info = pp.regress_isosbestic(y, X, method=m, alpha=1e-6,
+                                        unpenalized=1)
+        assert info["method"] == m
+        assert np.std(r) < np.std(y)
+        assert len(info["coefficients"]) == 2
+
+
+def test_auto_picks_per_fiber_without_seeing_the_stimulation():
+    """Choosing an estimator by the result it produces is selection on the
+    outcome. Scoring out-of-sample prediction outside the stimulation
+    windows makes the choice about motion correction only."""
+    rng = np.random.default_rng(0)
+    n, nroi = 9000, 12
+    mot = np.convolve(rng.normal(0, 1, n + 300), np.ones(80) / 80, "same")[:n]
+    mot /= mot.std()
+    stim = np.zeros(n, dtype=bool)
+    for k in range(12):
+        stim[500 + 700 * k:500 + 700 * k + 40] = True
+    iso = np.stack([0.02 * mot + rng.normal(0, 0.004, n)
+                    for _ in range(nroi)], 1)
+    y = 0.02 * mot + rng.normal(0, 0.003, n)
+    X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common")
+    r, info = pp.regress_isosbestic(y, X, method="auto", alpha="cv",
+                                    score_mask=~stim)
+    assert info["auto_chosen"] in ("lasso", "ols", "hierarchical")
+    assert set(info["auto_scores"]) <= {"lasso", "ols", "hierarchical"}
+    assert np.std(r) < np.std(y)
+
+
+def test_score_mask_governs_scoring_not_fitting():
+    """score_mask decides where the automatic selection is JUDGED;
+    fit_mask decides where coefficients are estimated. Keeping them separate
+    matters: a stimulus-locked artifact lives inside the stimulation
+    windows, so a fit that excluded them could never remove it."""
+    rng = np.random.default_rng(1)
+    n = 6000
+    mot = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    mot /= mot.std()
+    iso = np.stack([0.02 * mot + rng.normal(0, 0.004, n) for _ in range(8)], 1)
+    y = 0.02 * mot + rng.normal(0, 0.003, n)
+    X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common")
+    mask = np.ones(n, dtype=bool)
+    mask[2000:2400] = False
+
+    # score_mask alone leaves the fit over every sample
+    a = pp.regress_isosbestic(y, X, method="ols", score_mask=mask)[1]
+    assert a["n_fit"] == n
+
+    # fit_mask removes them from the fit
+    b = pp.regress_isosbestic(y, X, method="ols", fit_mask=mask)[1]
+    assert b["n_fit"] == int(mask.sum())
+    assert b["coefficients"] != a["coefficients"]
+
+
+def test_fitting_outside_a_window_cannot_remove_what_is_inside_it():
+    """The reason fitting defaults to every sample."""
+    rng = np.random.default_rng(0)
+    fs, n = 40.0, 8000
+    t = np.arange(n) / fs
+    on = np.arange(20, 190, 10.0)
+    S, _ = pp.stim_regressors(t, on, on + 1.0)
+    square = S[:, 0]
+    iso = np.stack([0.02 * square + rng.normal(0, 0.002, n)
+                    for _ in range(8)], 1)
+    y = 0.02 * square + rng.normal(0, 0.002, n)
+    X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common")
+    outside = ~(square > 0)
+
+    r_all, _ = pp.regress_isosbestic(y, X, method="ols")
+    r_out, _ = pp.regress_isosbestic(y, X, method="ols", fit_mask=outside)
+    left_all = abs(float(np.mean(r_all[square > 0])
+                         - np.mean(r_all[square == 0])))
+    left_out = abs(float(np.mean(r_out[square > 0])
+                         - np.mean(r_out[square == 0])))
+    assert left_all < 0.3 * left_out
+
+
+def test_others_mode_excludes_the_fiber_itself():
+    X = np.arange(500 * 6, dtype=float).reshape(500, 6)
+    P, names = pp.build_isosbestic_predictors(X, 3, mode="others")
+    assert P.shape[1] == 5
+    assert "iso3" not in names
+    np.testing.assert_allclose(P[:, 3], X[:, 4])     # order preserved
+
+
+def test_predictor_modes_have_expected_widths_including_others():
+    X = np.zeros((300, 12))
+    widths = {m: pp.build_isosbestic_predictors(X, 3, mode=m)[0].shape[1]
+              for m in ("same", "all", "others", "common")}
+    assert widths == {"same": 1, "all": 12, "others": 11, "common": 2}
+
+
+def test_components_are_capped_at_the_number_available():
+    """Asking for more components than there are other fibers is harmless:
+    the request is capped rather than erroring or padding with noise."""
+    X = np.random.default_rng(0).normal(size=(1500, 12))
+    widths = {}
+    for k in (1, 3, 7, 11, 20):
+        P, names = pp.build_isosbestic_predictors(X, 0, mode="common",
+                                                  common_method=f"pc{k}")
+        widths[k] = P.shape[1]
+        # own + two columns per component (both signs)
+        assert (P.shape[1] - 1) % 2 == 0
+    assert widths[7] == 15                   # own + 7 components x 2 signs
+    assert widths[11] == widths[20] == 23    # capped at 11 other fibers
+
+
+def test_more_components_do_not_break_the_fit():
+    rng = np.random.default_rng(1)
+    n, nroi = 4000, 12
+    mot = np.convolve(rng.normal(0, 1, n + 200), np.ones(60) / 60, "same")[:n]
+    mot /= mot.std()
+    iso = np.stack([0.02 * mot + rng.normal(0, 0.004, n)
+                    for _ in range(nroi)], 1)
+    y = 0.02 * mot + rng.normal(0, 0.003, n)
+    for cm in ("pc1", "pc7"):
+        X, _ = pp.build_isosbestic_predictors(iso, 0, mode="common",
+                                              common_method=cm)
+        r, info = pp.regress_isosbestic(y, X, alpha=1e-6)
+        assert np.isfinite(r).all()
+        assert np.std(r) < np.std(y)

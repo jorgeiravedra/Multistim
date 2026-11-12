@@ -334,6 +334,12 @@ def main() -> int:
                          "n <= --max-trials-shown. With few trials the mean "
                          "hides how much of it rests on one trial.")
     ap.add_argument("--max-trials-shown", type=int, default=25)
+    ap.add_argument("--target-effect", type=float, default=0.003,
+                    help="effect size, as dF/F, for the power table: how "
+                         "many trials each channel would need to resolve it. "
+                         "Default 0.3%%.")
+    ap.add_argument("--target-z", type=float, default=3.0,
+                    help="detection threshold for the power table")
     ap.add_argument("--windows", default=None,
                     help="run several response windows in one go, writing a "
                          "labelled set of outputs per window. Format "
@@ -800,10 +806,27 @@ def _run(args) -> int:
             n_ok_t = np.isfinite(np.stack([y[i - npre:i + npost]
                                            for i in idx])).sum(axis=0)
             gap = n_ok_t == 0
-            if gap.any():
+
+            # Scale the axis to the MEAN and its null band, not to the
+            # trials. With few trials one excursion otherwise sets the range
+            # and flattens the quantity being measured; trials that leave the
+            # axis are counted in the title rather than silently cropped.
+            ref = np.concatenate([obs[np.isfinite(obs)],
+                                  lo[np.isfinite(lo)], hi[np.isfinite(hi)]])
+            if ref.size:
+                span = float(np.nanmax(ref) - np.nanmin(ref)) or 1e-6
+                ylo = float(np.nanmin(ref)) - 0.18 * span
+                yhi = float(np.nanmax(ref)) + 0.18 * span
+                ax.set_ylim(ylo, yhi)
+            else:
                 ylo, yhi = ax.get_ylim()
+            n_clipped = 0
+            if show_trials:
+                n_clipped = int(np.sum(np.any((W < ylo) | (W > yhi), axis=1)))
+
+            if gap.any():
                 ax.fill_between(tt, ylo, yhi, where=gap, color="C1",
-                                alpha=0.22, lw=0, step="mid")
+                                alpha=0.30, lw=0, step="mid", zorder=0)
                 blank_frac[r] = float(gap[r0:r1].mean())
             ax.axvspan(0, width, color="C0", alpha=0.10, lw=0)
             _shade_timescales(ax)
@@ -817,6 +840,13 @@ def _run(args) -> int:
             axi.fill_between(tt[m], lo[m], hi[m], color="0.85", lw=0)
             axi.plot(tt[m], obs[m], color="C3", lw=0.9)
             _shade_timescales(axi, show_slow=False)
+            if gap[m].any():
+                # The gap is a fraction of a second: invisible on the main
+                # axis, and exactly where the response would be.
+                ilo, ihi = axi.get_ylim()
+                axi.fill_between(tt[m], ilo, ihi, where=gap[m], color="C1",
+                                 alpha=0.35, lw=0, step="mid", zorder=0)
+                axi.set_ylim(ilo, ihi)
             axi.axhline(0, color="k", lw=0.3, ls=":")
             axi.axvline(0, color="k", lw=0.4, ls="--")
             axi.set_xticks([0, 0.1, 0.5])
@@ -833,6 +863,10 @@ def _run(args) -> int:
             ttl = f"{r}  z={z:+.1f} p={p:.3f}"
             if np.isfinite(z_slow):
                 ttl += f"   slow z={z_slow:+.1f}"
+            if n_clipped:
+                ttl += f"   [{n_clipped}/{n_ev} trials off-axis]"
+            if gap.any():
+                ttl += f"   [{gap.sum()} blanked]"
             ax.set_title(ttl, fontsize=5.5)
             ax.tick_params(labelsize=5)
         for ax in axes[-1]:
@@ -911,6 +945,53 @@ def _run(args) -> int:
               "meaningful; quote the floor of the channel an effect was seen "
               "in.")
         print("  The floor scales as 1/sqrt(n), so 4x more bursts halves it.")
+
+        # ---- how many trials would each channel need? ------------------- #
+        # The null SD above is the SD of the trial MEAN at this session's n.
+        # Single-trial variability follows as sd1 = null_sd * sqrt(n), and
+        # the n needed to resolve an effect of a given size is then
+        # n_req = (z * sd1 / effect)^2. Required n differs across channels by
+        # the square of their noise ratio, so a session-wide trial count is
+        # adequate for some fibers and hopeless for others.
+        tgt, tz = float(args.target_effect), float(args.target_z)
+        print(f"\n  --- trials needed to resolve a {tgt:.2%} effect at "
+              f"z={tz:g} ---")
+        print("  (and the effect each channel CAN resolve at this session's "
+              f"n={n_ev_med})")
+        print(f"  {'recorded':10s} {'single-trial SD':>16s} "
+              f"{'resolvable now':>15s} {'n needed':>9s} "
+              f"{'session at 10s ISI':>19s}")
+        rows_pw = []
+        for rec, sdm in per_rec.items():
+            sd1 = float(sdm) * np.sqrt(max(n_ev_med, 1))
+            n_req = (tz * sd1 / tgt) ** 2 if tgt > 0 else np.inf
+            resolvable = tz * sdm
+            mins = n_req * 10.0 / 60.0
+            rows_pw.append({"recorded_site": rec, "single_trial_sd": sd1,
+                            "resolvable_at_current_n": resolvable,
+                            "n_required": n_req,
+                            "target_effect": tgt, "target_z": tz})
+            print(f"  {rec:10s} {sd1:16.4%} {resolvable:14.3%} "
+                  f"{n_req:9.0f} {mins:16.0f} min")
+        pw = pd.DataFrame(rows_pw).sort_values("n_required")
+        pw.to_csv(out / f"{sid}_power{suf}.csv", index=False)
+
+        n_ok = int((pw["n_required"] <= n_ev_med).sum())
+        print(f"\n  {n_ok}/{len(pw)} channel(s) can already resolve "
+              f"{tgt:.2%} at n={n_ev_med}.")
+        med_req = float(pw["n_required"].median())
+        print(f"  Median channel needs n={med_req:.0f}; the quietest needs "
+              f"n={pw['n_required'].min():.0f}, the noisiest "
+              f"n={pw['n_required'].max():.0f} "
+              f"({pw['n_required'].max() / max(pw['n_required'].min(), 1):.0f}x "
+              "spread, the square of the noise ratio).")
+        print("  Required n scales with the SQUARE of the effect you want to "
+              "resolve: halving the target quadruples the trials.")
+        if med_req > 4 * n_ev_med:
+            print(f"  !! At n={n_ev_med} this session cannot resolve "
+                  f"{tgt:.2%} in most channels. A null result here is a "
+                  "statement about the measurement, not about the biology.")
+        print(f"  {sid}_power{suf}.csv")
 
     diag = df_diag_report(rows)
     if diag:

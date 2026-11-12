@@ -36,6 +36,7 @@ either inert or wrong rather than merely different:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
@@ -55,6 +56,7 @@ __all__ = [
     "estimate_f0",
     "compute_dff",
     "regress_isosbestic",
+    "stim_regressors",
     "ProcessedTraces",
     "preprocess_traces",
 ]
@@ -690,6 +692,25 @@ def build_isosbestic_predictors(
     component excludes fiber ``j`` so the two predictors are not the same
     quantity twice.
 
+    ``common_method`` is ``'median'`` or ``'pcN'``.  ``'pc1'`` assumes one
+    artifact waveform scaled differently in each fiber; ``'pc2'`` and
+    ``'pc3'`` add further components as separate regressors, which is the
+    right model if several independent things move -- bundle bending,
+    connector play, an LED drifting -- since those project onto different
+    directions.  Each extra component is another coefficient fitted from the
+    same data, so the gain has to be checked rather than assumed: compare the
+    detection floor, not the regression R^2, which rises with any added
+    predictor.
+
+    A caution on the penalty.  ``alpha='cv'`` selects the L1 strength by
+    cross-validated prediction error, which is dominated by slow drift.  A
+    brief artifact -- stray light during a one-second stimulation, a few
+    percent of the samples -- contributes almost nothing to that error, so
+    the cross-validated penalty can shrink the predictor carrying it, in
+    testing to exactly zero.  Where the artifact of interest is brief, set a
+    small fixed ``alpha`` (1e-6) rather than ``'cv'``, and check the result
+    on the artifact itself rather than on R^2.
+
     ``standardize`` scales each isosbestic to unit variance before combining.
     Without it a dim fiber, whose dF/F is large because its denominator is
     small, would dominate the common component through noise alone.
@@ -713,144 +734,373 @@ def build_isosbestic_predictors(
         O = (O - np.nanmean(O, axis=0, keepdims=True)) / sd
 
     if common_method == "median":
-        common = np.nanmedian(O, axis=1)
-    elif common_method == "pc1":
+        common = np.nanmedian(O, axis=1)[:, None]
+        names = ["common_median"]
+    elif re.fullmatch(r"pc\d+", str(common_method)):
+        # pcN keeps the first N components as SEPARATE regressors. One
+        # component assumes the artifact is a single waveform scaled per
+        # fiber; several allow for independent sources -- bundle bending,
+        # connector movement, a drifting LED -- that project differently.
+        n_pc = int(str(common_method)[2:])
         M = np.where(np.isfinite(O), O, 0.0)
         M = M - M.mean(axis=0, keepdims=True)
-        _, _, vt = np.linalg.svd(M, full_matrices=False)
-        common = M @ vt[0]
+        _, sv, vt = np.linalg.svd(M, full_matrices=False)
+        n_pc = max(1, min(n_pc, vt.shape[0]))
+        comp = M @ vt[:n_pc].T
+        # The sign of a principal component is arbitrary, but the regression
+        # constrains coefficients to be positive (an artifact adds to the
+        # signal channel, it does not subtract from it). A component that
+        # needs a negative weight would simply be zeroed, which is why extra
+        # components appeared to do nothing. Each is therefore supplied in
+        # both signs, and the fit keeps whichever it can use.
+        common = np.empty((comp.shape[0], 2 * n_pc))
+        names = []
+        for k in range(n_pc):
+            common[:, 2 * k] = comp[:, k]
+            common[:, 2 * k + 1] = -comp[:, k]
+            names += [f"common_pc{k + 1}+", f"common_pc{k + 1}-"]
     else:
-        raise ValueError(f"unknown common_method {common_method!r}")
+        raise ValueError(
+            f"unknown common_method {common_method!r}; expected 'median' or "
+            "'pcN' (pc1, pc2, pc3, ...)")
 
-    return np.column_stack([X[:, j], common]), ["own", f"common_{common_method}"]
+    # Split the two predictors so they do not compete, and in the direction
+    # that lets each do its job: the OWN term is residualised against the
+    # common component, not the other way round.
+    #
+    # The common component is an average over fibers, so it has the better
+    # signal-to-noise for anything shared -- bundle motion -- and should
+    # carry it. What is left of the own isosbestic after removing that is
+    # what this fiber alone sees: stray light from a nearby stimulation
+    # fiber, its own coupling change. That remainder is the part no other
+    # fiber can supply.
+    #
+    # Left collinear, the L1 penalty gives the weight to whichever predictor
+    # fits the shared drift better and shrinks the other -- to exactly zero
+    # in testing -- so a fiber-specific artifact went uncorrected.
+    own = X[:, j].astype(float).copy()
+    ok = np.isfinite(own) & np.all(np.isfinite(common), axis=1)
+    if ok.sum() > 10 and common.shape[1]:
+        C = common[ok] - common[ok].mean(axis=0, keepdims=True)
+        o = own[ok] - own[ok].mean()
+        try:
+            beta, *_ = np.linalg.lstsq(C, o, rcond=None)
+            own = own - common @ beta
+        except np.linalg.LinAlgError:
+            pass
+    return np.column_stack([own, common]), ["own_specific"] + names
 
-
-def regress_isosbestic(
-    signal: np.ndarray,
-    predictors: np.ndarray,
-    alpha: "float | str" = "cv",
-    n_splits: int = 5,
-    n_alphas: int = 20,
-    positive: bool = True,
-    random_state: int = 0,
-) -> tuple[np.ndarray, dict]:
-    """Remove the motion component predicted by the isosbestic channel(s).
-
-    ``alpha='cv'`` selects the Lasso penalty by **blocked** cross-validation —
-    contiguous folds, not shuffled ones, because photometry residuals are
-    strongly autocorrelated and a random split leaks neighbouring samples
-    across the fold boundary, which biases the penalty downward.
-
-    Selecting by training error, as the notebook did, is not model selection
-    at all: training MSE falls monotonically as the penalty shrinks, so the
-    smallest candidate alpha wins every time regardless of the data.
-
-    ``predictors`` may be the same fiber's isosbestic alone (one column) or
-    every fiber's.  Using all fibers captures shared motion better, but any
-    real signal that bleeds into the isosbestic channel is then also
-    subtracted, and for cross-region work that removes exactly the shared
-    variance of interest.  One column is the conservative default for
-    connectivity analyses.
-    """
-    from sklearn.linear_model import Lasso, LassoCV
-    from sklearn.model_selection import TimeSeriesSplit
-
-    y = np.asarray(signal, dtype=float).ravel()
-    X = np.asarray(predictors, dtype=float)
-    if X.ndim == 1:
-        X = X.reshape(-1, 1)
-    if X.shape[0] != y.size:
-        raise ValueError(f"predictors have {X.shape[0]} rows for {y.size} samples")
-
-    good = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
-    if good.sum() < 10:
-        raise ValueError("fewer than 10 finite samples; cannot regress")
-
-    if alpha == "cv":
-        cv = TimeSeriesSplit(n_splits=n_splits)
-        model = LassoCV(cv=cv, positive=positive, max_iter=5000,
-                        random_state=random_state,
-                        **_alpha_grid_kwarg(LassoCV, n_alphas))
-        model.fit(X[good], y[good])
-        chosen = float(model.alpha_)
-    else:
-        chosen = float(alpha)
-        model = Lasso(alpha=chosen, positive=positive, max_iter=5000,
-                      random_state=random_state)
-        model.fit(X[good], y[good])
-
-    pred = np.full(y.size, np.nan)
-    pred[good] = model.predict(X[good])
-    resid = y - pred
-
-    ss_res = float(np.nansum((y[good] - pred[good]) ** 2))
-    ss_tot = float(np.nansum((y[good] - np.nanmean(y[good])) ** 2))
-    return resid, {
-        "alpha": chosen,
-        "alpha_source": "blocked CV" if alpha == "cv" else "fixed",
-        "coefficients": np.asarray(model.coef_, dtype=float).tolist(),
-        "intercept": float(model.intercept_),
-        "r2_in_sample": 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
-        "n_used": int(good.sum()),
-        "positive": positive,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Orchestration
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class ProcessedTraces:
-    dff: np.ndarray                   # (n_sig, n_roi), motion-corrected
-    dff_raw: np.ndarray               # before isosbestic regression
-    f0: np.ndarray                    # (n_sig, n_roi)
-    isos_dff: np.ndarray              # (n_iso, n_roi)
-    t: np.ndarray                     # DAQ time per signal sample
-    frames: np.ndarray                # video frame index per signal sample
-    blanked: np.ndarray               # boolean, per signal sample
-    labels: Optional[list[str]] = None
-    epochs: dict = field(default_factory=dict)
+    """Output of :func:`preprocess_traces`.
+
+    ``dff`` is after motion regression, ``dff_raw`` before it, so the two can
+    be compared and the regression judged rather than taken on trust.  ``f0``
+    is the fitted baseline on the signal channel, ``isos_dff`` the isosbestic
+    put through the identical treatment, and ``blanked`` marks samples
+    removed as laser-contaminated (NaN in the traces).
+    """
+
+    dff: np.ndarray
+    dff_raw: np.ndarray
+    f0: np.ndarray
+    isos_dff: np.ndarray
+    t: np.ndarray
+    frames: np.ndarray
+    blanked: np.ndarray
+    labels: list
+    epochs: Optional[list] = None
     qc: dict = field(default_factory=dict)
 
     @property
     def n_roi(self) -> int:
         return int(self.dff.shape[1])
 
-    def to_frame(self, include_isosbestic: bool = True):
-        """Processed traces as a table.
+    @property
+    def n_samples(self) -> int:
+        return int(self.dff.shape[0])
 
-        The isosbestic dF/F is included as ``<roi>__iso`` columns.  It is not
-        decoration: a decrease at a stimulated site is produced both by
-        inhibition of the recorded population and by photobleaching or
-        quenching of the indicator by the stimulation light.  Those are
-        indistinguishable in the 470 channel and separated by the 415 one,
-        since bleaching removes fluorophore and calcium changes do not.
-        """
-        import pandas as pd
 
-        cols = self.labels or [f"roi{i + 1}" for i in range(self.n_roi)]
-        df = pd.DataFrame(self.dff, columns=cols)
-        df.insert(0, "t", self.t)
-        df.insert(1, "frame", self.frames)
-        df["blanked"] = self.blanked
-        if include_isosbestic and self.isos_dff is not None:
-            for j, c in enumerate(cols):
-                df[f"{c}__iso"] = self.isos_dff[:, j]
-        return df
+def stim_regressors(
+    t: np.ndarray,
+    onset_t: np.ndarray,
+    offset_t: np.ndarray,
+    decay_tau: float = 0.4,
+    rise_tau: float = 0.07,
+) -> tuple[np.ndarray, list[str]]:
+    """Two stimulus-locked regressors that differ in kinetics.
 
-    def describe(self) -> str:
-        lines = [f"{self.dff.shape[0]} samples x {self.n_roi} ROIs "
-                 f"@ {self.qc.get('effective_fps', float('nan')):.1f} Hz",
-                 f"  epochs: {', '.join(self.epochs)}",
-                 f"  blanked: {int(self.blanked.sum())} samples"]
-        r2 = self.qc.get("regression_r2", [])
-        if len(r2):
-            lines.append(f"  isosbestic R^2: median {np.nanmedian(r2):.3f} "
-                         f"[{np.nanmin(r2):.3f}-{np.nanmax(r2):.3f}]")
-        for w in self.qc.get("warnings", []):
-            lines.append(f"  ! {w}")
-        return "\n".join(lines)
+    An optical artifact follows the command exactly: on within a sample, off
+    within a sample, no tail.  A calcium response cannot -- GCaMP6f takes
+    tens of milliseconds to rise and hundreds to decay, so it outlasts the
+    command.  The two are therefore separable by SHAPE even though both are
+    time-locked to the laser:
+
+    * ``stim_square`` is the command envelope itself;
+    * ``stim_kinetic`` is that envelope convolved with the indicator's
+      impulse response.
+
+    Fitting both and reading the kinetic coefficient is the measurement;
+    the square coefficient absorbs the artifact.  This is the only way to
+    separate them within a session, because the isosbestic cannot do it: the
+    artifact is additive (a fixed number of stray photons, so a larger
+    FRACTION of the dimmer 415 channel) while motion is multiplicative (the
+    same fraction of both), and one coefficient on the isosbestic has to
+    serve both ratios at once.
+
+    A caveat that cannot be designed away: a response that genuinely has no
+    kinetics -- an instantaneous, square physiological change -- would be
+    absorbed by the square term. No such calcium response exists, which is
+    what makes the separation safe here, but the assumption is doing work
+    and should be stated.
+    """
+    t = np.asarray(t, dtype=float).ravel()
+    on = np.atleast_1d(np.asarray(onset_t, dtype=float))
+    off = np.atleast_1d(np.asarray(offset_t, dtype=float))
+    square = np.zeros(t.size, dtype=float)
+    for a, b in zip(on, off):
+        square[(t >= a) & (t < b)] = 1.0
+
+    period = float(np.median(np.diff(t))) if t.size > 1 else 0.025
+    s_ = np.arange(0.0, max(8 * decay_tau, 4 * period), period)
+    h = (1.0 - np.exp(-s_ / max(rise_tau, 1e-6))) * np.exp(-s_ / decay_tau)
+    if h.max() > 0:
+        h = h / h.max()
+    kinetic = np.convolve(square, h)[:t.size]
+    if kinetic.max() > 0:
+        kinetic = kinetic / kinetic.max()
+    return np.column_stack([square, kinetic]), ["stim_square", "stim_kinetic"]
+
+
+def regress_isosbestic(
+    y: np.ndarray,
+    X: np.ndarray,
+    alpha: "float | str" = "cv",
+    method: str = "lasso",
+    unpenalized: int = 0,
+    head_method: str = "ols",
+    head_alpha: "float | str" = "cv",
+    keep: Optional[Sequence[int]] = None,
+    score_mask: Optional[np.ndarray] = None,
+    fit_mask: Optional[np.ndarray] = None,
+    candidates: Sequence[str] = ("lasso", "ols", "hierarchical"),
+    n_alphas: int = 30,
+) -> tuple[np.ndarray, dict]:
+    """Remove from ``y`` what the predictors ``X`` can explain.
+
+    ``method`` selects the estimator, because no single one suits every
+    case:
+
+    ``'lasso'``
+        Non-negative Lasso (the default).  The non-negativity encodes that
+        an artifact ADDS to the signal channel; the L1 term drops predictors
+        that earn nothing.  Its weakness is that a cross-validated penalty
+        is tuned on total prediction error, which slow drift dominates, so
+        it can discard a predictor carrying a brief artifact.
+    ``'ols'``
+        Ordinary least squares, no penalty and no sign constraint.  Fits
+        every predictor fully, which is what a brief artifact needs, at the
+        cost of fitting noise when predictors are many or collinear.
+    ``'ridge'``
+        L2, shrinking all coefficients smoothly rather than zeroing any.
+        Sensible with several correlated predictors.
+    ``'hierarchical'``
+        Two stages. The first ``unpenalized`` columns are fitted with
+        ``head_method`` (at ``head_alpha``), and the rest are fitted to the
+        residual with ``method``'s usual Lasso at ``alpha``. The own-fiber
+        isosbestic is therefore never shrunk away by a penalty chosen for
+        the others, which is the failure the plain Lasso showed on a
+        minority artifact.
+
+        Both stages are configurable because neither choice is obviously
+        right. An unpenalized OLS head fits the own fiber fully, including
+        its noise; a penalized head fits it more conservatively and can
+        work better where the isosbestic carries the artifact strongly.
+        Which wins is a property of the recording, not something to settle
+        by argument.
+
+    ``unpenalized`` is the number of leading columns in the first stage.
+
+    ``'auto'``
+        Fit every estimator in ``candidates`` and keep the one with the
+        lowest out-of-sample error on held-out time blocks, scored only
+        where ``score_mask`` is True.  Pass a mask that EXCLUDES the
+        stimulation windows: the choice is then made on how well each
+        estimator predicts motion, and cannot be influenced by the response
+        being measured.  Which estimator wins differs by fiber -- a noisy
+        isosbestic benefits from shrinkage, a clean one from fitting fully
+        -- and this picks per fiber without selecting on the outcome.
+
+    ``keep`` names columns to ESTIMATE but not subtract.  A stimulus-locked
+    response regressor belongs here: it must be in the model, or the
+    nuisance terms absorb the response and their coefficients are wrong,
+    but subtracting it would remove the very thing being measured.  Its
+    fitted coefficient is reported in ``info['coefficients']`` and is the
+    amplitude estimate.
+
+    ``r2_in_sample`` is reported for diagnosis only.  It rises with any
+    added predictor, so it cannot be used to choose between these; judge on
+    the artifact or on the detection floor.
+    """
+    import warnings as _w
+
+    y = np.asarray(y, dtype=float).ravel()
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    if X.shape[0] != y.size:
+        X = X.T
+    ok = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    # Which samples the coefficients are FITTED on. This defaults to all of
+    # them, and that default matters: a stimulus-locked artifact lives
+    # INSIDE the stimulation windows, so a fit that excludes them never sees
+    # it and cannot remove it. Excluding them protects the response from
+    # being partly absorbed, but the two goals are in direct conflict and no
+    # choice of mask serves both -- separating artifact from response needs
+    # the shape difference (see stim_regressors), not a mask.
+    #
+    # ``score_mask`` therefore governs SCORING only, which is what the
+    # automatic selection needs. ``fit_mask`` is a separate, explicit
+    # opt-in for the rarer case where the response must be protected and
+    # the artifact is not an issue.
+    fit_ok = ok if fit_mask is None else (ok & np.asarray(fit_mask,
+                                                          dtype=bool))
+    ok_fit = fit_ok if fit_ok.sum() >= 50 else ok
+    info: dict = {"method": method, "n_used": int(ok.sum()),
+                  "alpha": float("nan"), "alpha_source": "none",
+                  "coefficients": [], "r2_in_sample": float("nan"),
+                  "noise_reduction": float("nan")}
+    if ok.sum() < 20:
+        info["warning"] = "too few finite samples; no regression applied"
+        return y.copy(), info
+
+    Xo, yo = X[ok_fit], y[ok_fit]
+    Xmu = Xo.mean(axis=0, keepdims=True)
+    ymu = yo.mean()
+    Xc = Xo - Xmu
+    yc = yo - ymu
+    info["n_fit"] = int(ok_fit.sum())
+
+    def _ols(A, b):
+        coef, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return coef
+
+    if method == "auto":
+        from sklearn.model_selection import TimeSeriesSplit
+
+        sm = (np.ones(y.size, dtype=bool) if score_mask is None
+              else np.asarray(score_mask, dtype=bool))
+        sm_o = sm[ok_fit]
+        best, best_err, scores = None, np.inf, {}
+        for cand in candidates:
+            errs = []
+            for tr, te in TimeSeriesSplit(n_splits=4).split(Xc):
+                te_s = te[sm_o[te]]
+                if te_s.size < 20 or tr.size < 50:
+                    continue
+                try:
+                    _, sub = regress_isosbestic(
+                        yc[tr], Xc[tr], alpha=alpha, method=cand,
+                        unpenalized=unpenalized, head_method=head_method,
+                        head_alpha=head_alpha)
+                except Exception:
+                    continue
+                c = np.asarray(sub["coefficients"], dtype=float).ravel()
+                if c.size != Xc.shape[1]:
+                    continue
+                errs.append(float(np.mean((yc[te_s] - Xc[te_s] @ c) ** 2)))
+            if errs:
+                scores[cand] = float(np.mean(errs))
+                if scores[cand] < best_err:
+                    best, best_err = cand, scores[cand]
+        method = best or "lasso"
+        info["method"] = method
+        info["auto_scores"] = scores
+        info["auto_chosen"] = method
+
+    if method == "ols":
+        coef = _ols(Xc, yc)
+        info["alpha"] = 0.0
+        info["alpha_source"] = "none (OLS)"
+    elif method == "ridge":
+        from sklearn.linear_model import Ridge, RidgeCV
+
+        if alpha == "cv":
+            m = RidgeCV(alphas=np.logspace(-8, 2, n_alphas))
+        else:
+            m = Ridge(alpha=float(alpha))
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            m.fit(Xc, yc)
+        coef = np.asarray(m.coef_, dtype=float).ravel()
+        info["alpha"] = float(getattr(m, "alpha_", alpha if alpha != "cv"
+                                      else np.nan))
+        info["alpha_source"] = ("CV" if alpha == "cv" else "fixed")
+    elif method == "hierarchical":
+        k = max(1, min(int(unpenalized or 1), Xc.shape[1]))
+        if head_method == "ols":
+            head = _ols(Xc[:, :k], yc)
+            info["alpha_source"] = "hierarchical: OLS head"
+        else:
+            _, hsub = regress_isosbestic(yc, Xc[:, :k], alpha=head_alpha,
+                                         method=head_method)
+            head = np.asarray(hsub["coefficients"], dtype=float).ravel()
+            info["alpha_source"] = (f"hierarchical: {head_method} head "
+                                    f"({hsub['alpha_source']})")
+        info["head_method"] = head_method
+        info["head_alpha"] = (0.0 if head_method == "ols"
+                              else float(hsub["alpha"]))
+        resid = yc - Xc[:, :k] @ head
+        if Xc.shape[1] > k:
+            tail, sub = regress_isosbestic(resid, Xc[:, k:], alpha=alpha,
+                                           method="lasso")
+            coef = np.r_[head, np.asarray(sub["coefficients"],
+                                          dtype=float).ravel()]
+            info["alpha"] = sub["alpha"]
+            info["alpha_source"] += f" + tail {sub['alpha_source']}"
+        else:
+            coef = head
+            info["alpha"] = 0.0
+    else:
+        from sklearn.linear_model import Lasso, LassoCV
+
+        if alpha == "cv":
+            from sklearn.model_selection import TimeSeriesSplit
+
+            kw = _alpha_grid_kwarg(LassoCV, n_alphas)
+            m = LassoCV(positive=True, fit_intercept=False,
+                        cv=TimeSeriesSplit(n_splits=5), **kw)
+        else:
+            m = Lasso(alpha=float(alpha), positive=True, fit_intercept=False)
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            m.fit(Xc, yc)
+        coef = np.asarray(m.coef_, dtype=float).ravel()
+        info["alpha"] = float(getattr(m, "alpha_", alpha if alpha != "cv"
+                                      else np.nan))
+        info["alpha_source"] = ("blocked CV" if alpha == "cv" else "fixed")
+
+    # Everything is estimated jointly; only the nuisance columns are
+    # subtracted. A response regressor left out of the fit would have its
+    # variance absorbed by the nuisance terms; one subtracted along with
+    # them would be removed from the data.
+    sub = np.ones(X.shape[1], dtype=bool)
+    if keep is not None:
+        for c in keep:
+            if 0 <= int(c) < sub.size:
+                sub[int(c)] = False
+    info["kept_columns"] = [int(c) for c in np.flatnonzero(~sub)]
+    pred_all = (X - Xmu)[:, sub] @ coef[sub]
+    resid = y - np.where(np.isfinite(pred_all), pred_all, 0.0)
+    fitted = Xc @ coef
+    denom = float(np.sum(yc ** 2))
+    info["coefficients"] = [float(c) for c in coef]
+    info["r2_in_sample"] = (float(1.0 - np.sum((yc - fitted) ** 2) / denom)
+                            if denom > 0 else float("nan"))
+    sd_before = float(np.std(y[ok]))
+    sd_after = float(np.std(resid[ok]))
+    info["noise_reduction"] = (1.0 - sd_after / sd_before
+                               if sd_before > 0 else float("nan"))
+    return resid, info
 
 
 def preprocess_traces(
@@ -869,6 +1119,12 @@ def preprocess_traces(
     predictors: str = "common",
     common_method: str = "median",
     regress: bool = True,
+    regress_method: str = "lasso",
+    head_method: str = "ols",
+    head_alpha: "float | str" = "cv",
+    unpenalized: int = 1,
+    stim_artifact: bool = False,
+    stim_decay_tau: float = 0.4,
     blank_pad: int = 1,
     smooth: Optional[int] = None,
     large_sd_dff: float = 0.05,
@@ -1030,6 +1286,8 @@ def preprocess_traces(
     # ---- isosbestic regression ------------------------------------------ #
     dff = np.empty_like(dff_raw)
     r2, alphas = [], []
+    stim_amp = []
+    chosen = []
     if single_channel or not regress:
         dff = dff_raw.copy()
         r2 = [float("nan")] * n_roi
@@ -1039,10 +1297,54 @@ def preprocess_traces(
     else:
         pred_names = None
         coefs = []
+        # A stimulus-locked artifact cannot be removed by the isosbestic
+        # alone: stray light is additive (a larger FRACTION of the dimmer
+        # 415) while motion is multiplicative (the same fraction of both),
+        # and one coefficient on the isosbestic serves both ratios at once.
+        # Two stimulus-locked regressors separate them by kinetics: the
+        # square command envelope has none, a calcium response must have
+        # some. The square term is subtracted; the kinetic term is estimated
+        # and kept, because subtracting it would remove the measurement.
+        stim_X = stim_names = None
+        if stim_artifact and laser_onset_t is not None and len(laser_onset_t):
+            stim_X, stim_names = stim_regressors(
+                dm.signal_t, laser_onset_t,
+                (laser_offset_t if laser_offset_t is not None
+                 else np.asarray(laser_onset_t) + 1.0),
+                decay_tau=stim_decay_tau)
+        # For automatic per-fiber selection, SCORE only where no laser was
+        # on, so the choice is about motion correction and cannot be
+        # influenced by the response. Coefficients are still fitted on every
+        # sample: a stimulus-locked artifact lives inside these windows.
+        score_mask = np.ones(n_sig, dtype=bool)
+        if laser_onset_t is not None and len(laser_onset_t):
+            offs = (laser_offset_t if laser_offset_t is not None
+                    else np.asarray(laser_onset_t) + 1.0)
+            for a, b in zip(np.atleast_1d(laser_onset_t), np.atleast_1d(offs)):
+                score_mask &= ~((dm.signal_t >= a - 1.0)
+                                & (dm.signal_t <= b + 3.0))
+        stim_amp = []
+        chosen = []
         for j in range(n_roi):
             X, pred_names = build_isosbestic_predictors(
                 iso_dff, j, mode=predictors, common_method=common_method)
-            resid, info = regress_isosbestic(dff_raw[:, j], X, alpha=alpha)
+            keep = None
+            if stim_X is not None:
+                n_iso = X.shape[1]
+                X = np.column_stack([X, stim_X])
+                keep = [n_iso + 1]            # the kinetic column
+                pred_names = list(pred_names) + list(stim_names)
+            resid, info = regress_isosbestic(
+                dff_raw[:, j], X, alpha=alpha,
+                method=("ols" if stim_X is not None and
+                        regress_method == "lasso" else regress_method),
+                head_method=head_method, head_alpha=head_alpha,
+                unpenalized=unpenalized, keep=keep,
+                score_mask=score_mask)
+            if keep is not None:
+                stim_amp.append(info["coefficients"][keep[0]])
+            if "auto_chosen" in info:
+                chosen.append(info["auto_chosen"])
             dff[:, j] = resid
             r2.append(info["r2_in_sample"])
             alphas.append(info["alpha"])
@@ -1146,6 +1448,15 @@ def preprocess_traces(
             "f0_boundary_jumps": f0_jumps,
             "large_sd_dff_threshold": large_sd_dff,
             "predictors": None if single_channel else predictors,
+            "regression_method": (None if single_channel or not regress
+                                  else regress_method),
+            "regression_method_chosen": (chosen if chosen else None),
+            "stim_artifact_regression": bool(stim_artifact),
+            # Per-fiber amplitude of the kinetic (indicator-shaped) term.
+            # This is the response estimate when the stimulus-locked
+            # regressors are fitted: the square term has absorbed whatever
+            # had no kinetics, which an optical artifact does not.
+            "stim_kinetic_amplitude": (stim_amp if stim_amp else None),
             "single_channel": single_channel,
             "baseline_tau_s": baseline_tau_s,
             "lambda": lam_value,

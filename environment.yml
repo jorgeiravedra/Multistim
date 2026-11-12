@@ -37,11 +37,6 @@ dependencies:
   - matplotlib>=3.8
   - seaborn
 
-  # --- interactive comparison app ------------------------------------------ #
-  - dash
-  - plotly
-  - imageio
-
   # --- notebook ------------------------------------------------------------ #
   # ipykernel is required for this env to appear as a Jupyter kernel; without
   # it a notebook launched from base runs on base's interpreter and will not

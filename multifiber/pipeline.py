@@ -91,6 +91,12 @@ class PipelineConfig:
     #: how the common isosbestic component is built: "median" (robust) or
     #: "pc1" (optimal if the artifact is one scaled waveform).
     isosbestic_common_method: str = "median"
+    #: Estimator for the motion regression: lasso | ols | ridge | hierarchical.
+    regress_method: str = "lasso"
+    #: Fit stimulus-locked square and kinetic regressors, subtracting the
+    #: square (an optical artifact has no kinetics) and keeping the kinetic
+    #: term as the response estimate.
+    stim_artifact_regression: bool = False
     #: Skip the isosbestic regression entirely.  Worth setting when the 415
     #: channel is near-dark: its dF/F is then dominated by its own small
     #: denominator and subtracting it injects noise.
@@ -544,6 +550,8 @@ def process_session(
             alpha=cfg.regression_alpha,
             predictors=cfg.regression_predictors,
             common_method=cfg.isosbestic_common_method,
+            regress_method=cfg.regress_method,
+            stim_artifact=cfg.stim_artifact_regression,
             regress=cfg.regress_isosbestic,
             common_mode=cfg.common_mode,
             common_mode_exclude=stim_roi_idx,
