@@ -131,9 +131,19 @@ def build_controls(dash, prefix: str, defaults: dict):
                           step=1, style={"width": "55px"}),
             ], style={"display": "flex", "gap": "6px",
                       "alignItems": "center"}),
-            "estimator, penalty and number of leading columns for the first "
-            "stage; step 2 uses the estimator and alpha above. Only applies "
-            "when the estimator is hierarchical."),
+            "estimator, penalty and number of leading columns for the "
+            "first stage. Only applies when the estimator is "
+            "hierarchical."),
+        row("hierarchical: step 2",
+            dcc.RadioItems(id=f"{prefix}-tail",
+                           options=[{"label": " lasso", "value": "lasso"},
+                                    {"label": " OLS", "value": "ols"},
+                                    {"label": " ridge", "value": "ridge"}],
+                           value=defaults.get("tail", "lasso"), inline=True),
+            "fitted to the first stage's residual, at the Lasso alpha above. "
+            "Sparse keeps only components that earn their place; OLS or "
+            "ridge use them all, which suits principal components, which do "
+            "not compete."),
         row("stimulus-locked artifact",
             dcc.RadioItems(id=f"{prefix}-stimart",
                            options=[{"label": " off", "value": 0},
@@ -278,7 +288,8 @@ def main() -> int:
     DEF = dict(tau=60, diff=2, method="airpls", pred="common",
                common="median", alpha="cv", blank=1, base=0.5,
                resp=[0, 1.5], detrend="mean", stat="mean",
-               rmethod="lasso", stimart=0, head="ols", halpha="cv", unpen=1)
+               rmethod="lasso", stimart=0, head="ols", halpha="cv", unpen=1,
+               tail="lasso")
     ALT = dict(DEF, tau=20, pred="same", base=1.0,
                rmethod="hierarchical", stimart=0, head="lasso", halpha="cv")
 
@@ -557,8 +568,20 @@ def main() -> int:
                                                      "value": "ridge"}],
                                            value="ols", inline=True,
                                            style={"fontSize": "10px"}),
-                            dcc.Input(id="g-halpha", type="text", value="cv",
+                            dcc.Input(id="g-halpha", type="text",
+                                      value="cv",
                                       style={"width": "70px"}),
+                            html.Label("step 2",
+                                       style={"fontSize": "10px"}),
+                            dcc.RadioItems(id="g-tail",
+                                           options=[{"label": " lasso",
+                                                     "value": "lasso"},
+                                                    {"label": " OLS",
+                                                     "value": "ols"},
+                                                    {"label": " ridge",
+                                                     "value": "ridge"}],
+                                           value="lasso", inline=True,
+                                           style={"fontSize": "10px"}),
                         ]),
                         html.Div([
                             html.Label("Lasso alpha",
@@ -806,8 +829,20 @@ def main() -> int:
                                                      "value": "ridge"}],
                                            value="ols", inline=True,
                                            style={"fontSize": "10px"}),
-                            dcc.Input(id="pb-halpha", type="text", value="cv",
+                            dcc.Input(id="pb-halpha", type="text",
+                                      value="cv",
                                       style={"width": "70px"}),
+                            html.Label("step 2",
+                                       style={"fontSize": "10px"}),
+                            dcc.RadioItems(id="pb-tail",
+                                           options=[{"label": " lasso",
+                                                     "value": "lasso"},
+                                                    {"label": " OLS",
+                                                     "value": "ols"},
+                                                    {"label": " ridge",
+                                                     "value": "ridge"}],
+                                           value="lasso", inline=True,
+                                           style={"fontSize": "10px"}),
                         ]),
                         html.Div([
                             html.Label("Lasso alpha",
@@ -940,7 +975,7 @@ def main() -> int:
     def spec_from(vals, label):
         (tau, lam, diff, method, pred, common, alpha, blank, exp,
          base, resp, detrend, stat, lp, rmethod, stimart,
-         head, halpha, unpen) = vals
+         head, halpha, unpen, tail) = vals
         try:
             lam_v = float(lam) if lam not in (None, "") else None
         except ValueError:
@@ -963,14 +998,14 @@ def main() -> int:
             detrend=detrend, statistic=stat,
             regress_method=rmethod, stim_artifact=bool(stimart),
             head_method=head, head_alpha=_alpha(halpha),
-            unpenalized=int(unpen or 1),
+            tail_method=tail, unpenalized=int(unpen or 1),
             lowpass_hz=(float(lp) if lp else None), label=label)
 
     ids = lambda p: [Input(f"{p}-{k}", "value") for k in
                      ("tau", "lam", "diff", "method", "pred", "common",
                       "alpha", "blank", "exp", "base", "resp", "detrend",
                       "stat", "lp", "rmethod", "stimart", "head", "halpha",
-                      "unpen")]
+                      "unpen", "tail")]
 
     @app.callback(
         Output("fig-trace", "figure"), Output("fig-peth", "figure"),
@@ -982,8 +1017,8 @@ def main() -> int:
         if sd is None:
             return go.Figure(), go.Figure(), go.Figure(), "no session loaded"
         classes, labels_by_class = ST["classes"], ST["labels"]
-        a = spec_from(vals[:19], "A")
-        b = spec_from(vals[19:], "B")
+        a = spec_from(vals[:20], "A")
+        b = spec_from(vals[20:], "B")
         roi = int(roi)
 
         base = sd.events
@@ -1129,7 +1164,7 @@ def main() -> int:
                   Input("g-blank", "value"), Input("g-alpha", "value"),
                   Input("g-rmethod", "value"), Input("g-stimart", "value"),
                   Input("g-head", "value"), Input("g-halpha", "value"),
-                  Input("g-common", "value"),
+                  Input("g-tail", "value"), Input("g-common", "value"),
                   Input("g-pw", "value"),
                   Input("g-ph", "value"), Input("g-pal", "value"),
                   Input("g-colorby", "value"), Input("g-dash", "value"),
@@ -1137,8 +1172,8 @@ def main() -> int:
                   *ids("A"), *ids("B"))
     def grid(site, cond, which, stat, ncol, opts, nshift, xr, resp, base,
              g_tau, g_lp, g_pred, g_method, g_blank, g_alpha, g_rmethod,
-             g_stimart, g_head, g_halpha, g_common, pw, ph, palname,
-             colorby, dashmode, lw, *vals):
+             g_stimart, g_head, g_halpha, g_tail, g_common, pw, ph,
+             palname, colorby, dashmode, lw, *vals):
         from plotly.subplots import make_subplots
 
         sd = ST["sd"]
@@ -1148,9 +1183,9 @@ def main() -> int:
 
         pre, post = float(-min(xr[0], -0.1)), float(max(xr[1], 0.1))
         if which == "A":
-            base_spec = spec_from(vals[:19], "A")
+            base_spec = spec_from(vals[:20], "A")
         elif which == "B":
-            base_spec = spec_from(vals[19:], "B")
+            base_spec = spec_from(vals[20:], "B")
         else:
             base_spec = V.VariantSpec(
                 baseline_tau_s=float(g_tau or 60), baseline_method=g_method,
@@ -1160,6 +1195,7 @@ def main() -> int:
                 blank_laser=bool(g_blank), alpha=_alpha(g_alpha),
                 regress_method=g_rmethod, stim_artifact=bool(g_stimart),
                 head_method=g_head, head_alpha=_alpha(g_halpha),
+                tail_method=g_tail,
                 lowpass_hz=(float(g_lp) if g_lp else None))
         # The window controls belong to this tab even when the preprocessing
         # is inherited, so they are applied on top.
@@ -1324,13 +1360,13 @@ def main() -> int:
                   Input("pb-scale415", "value"), Input("pb-rows-sel", "value"),
                   Input("pb-alpha", "value"), Input("pb-rmethod", "value"),
                   Input("pb-stimart", "value"), Input("pb-head", "value"),
-                  Input("pb-halpha", "value"),
+                  Input("pb-halpha", "value"), Input("pb-tail", "value"),
                   State("pb-time", "value"),
                   *ids("A"), *ids("B"))
     def draw_session(rois, which, opts, win, pb_tau, pb_lp, pb_pred,
                      pb_method, pb_blank, scale470, scale415, rows_sel,
                      pb_alpha, pb_rmethod, pb_stimart, pb_head, pb_halpha,
-                     t_now, *vals):
+                     pb_tail, t_now, *vals):
         from plotly.subplots import make_subplots
 
         sd = ST["sd"]
@@ -1338,9 +1374,9 @@ def main() -> int:
             return go.Figure(), 1
 
         if which == "A":
-            spec = spec_from(vals[:19], "A")
+            spec = spec_from(vals[:20], "A")
         elif which == "B":
-            spec = spec_from(vals[19:], "B")
+            spec = spec_from(vals[20:], "B")
         else:
             spec = V.VariantSpec(
                 baseline_tau_s=float(pb_tau or 60),
@@ -1350,6 +1386,7 @@ def main() -> int:
                 blank_laser=bool(pb_blank),
                 alpha=_alpha(pb_alpha), regress_method=pb_rmethod,
                 head_method=pb_head, head_alpha=_alpha(pb_halpha),
+                tail_method=pb_tail,
                 stim_artifact=bool(pb_stimart),
                 lowpass_hz=(float(pb_lp) if pb_lp else None),
                 label="playback")
@@ -1371,7 +1408,18 @@ def main() -> int:
         pal = ["#0173B2", "#DE8F05", "#029E73", "#CC78BC", "#CA9161",
                "#949494", "#ECE133", "#56B4E9", "#D55E00", "#F0E442",
                "#009E73", "#000000"]
-        sig_state = int(np.bincount(sd.led_state).argmax())
+        # Which LED state is the signal channel. This must match what the
+        # pipeline does -- demux_channels takes the BRIGHTER state, since
+        # GCaMP emission under 470 exceeds its emission at the isosbestic --
+        # or the two raw rows are labelled the wrong way round and the
+        # processed row below them belongs to the other one.
+        #
+        # Taking the most COMMON state, as this did, is a coin flip: the two
+        # alternate, so their counts differ by at most one frame.
+        states = np.unique(sd.led_state)
+        means = {int(st): float(np.nanmean(sd.traces[sd.led_state == st]))
+                 for st in states}
+        sig_state = max(means, key=means.get)
         sig = sd.led_state == sig_state
         masks = {"470": sig, "415": ~sig}
         scales = {"470": scale470, "415": scale415}
